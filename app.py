@@ -12,7 +12,7 @@ api_key = st.text_input("أدخل مفتاح Gemini API بتاعك:", type="pass
 
 if api_key:
     genai.configure(api_key=api_key)
-    model = genai.GenerativeModel('gemini-2.0-flash')
+    model = genai.GenerativeModel('gemini-2.5-flash')
 
     uploaded_file = st.file_uploader("اختر ملف PDF", type=["pdf"])
 
