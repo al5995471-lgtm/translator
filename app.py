@@ -40,7 +40,6 @@ def clean_markdown(text):
 
 
 def make_rtl(p, size=13):
-    """فقرة عربي (يمين لليسار) حقيقية في Word"""
     pPr = p._p.get_or_add_pPr()
     pPr.append(OxmlElement('w:bidi'))
     for run in p.runs:
@@ -61,7 +60,6 @@ def add_line(out_doc, line):
     if not line:
         return
     p = out_doc.add_paragraph(line)
-    # سطر معادلة (من غير عربي): شمال لليمين وفي النص
     if not ARABIC.search(line) and EQUATION.search(line):
         p.alignment = WD_ALIGN_PARAGRAPH.CENTER
         for run in p.runs:
@@ -71,19 +69,47 @@ def add_line(out_doc, line):
         make_rtl(p, 13)
 
 
-def translate_page(model, page_num, text):
-    start = time.time()
-    response = model.generate_content(
-        f"{SYSTEM_PROMPT}\n\nالنص:\n{text}",
-        generation_config={"temperature": 0.2},
-        request_options={"timeout": 90, "retry": None},
-    )
-    return page_num, clean_markdown(response.text), time.time() - start
+@st.cache_data(show_spinner=False)
+def get_models(key):
+    genai.configure(api_key=key)
+    names = []
+    for m in genai.list_models():
+        if "generateContent" in m.supported_generation_methods:
+            names.append(m.name.replace("models/", ""))
+    return sorted(names)
+
+
+def translate_page(model_name, page_num, text):
+    model = genai.GenerativeModel(model_name)
+    last_err = None
+    for attempt in range(3):
+        start = time.time()
+        try:
+            response = model.generate_content(
+                f"{SYSTEM_PROMPT}\n\nالنص:\n{text}",
+                generation_config={"temperature": 0.2},
+                request_options={"timeout": 150, "retry": None},
+            )
+            return page_num, clean_markdown(response.text), time.time() - start, attempt + 1
+        except Exception as e:
+            last_err = e
+            time.sleep(3)
+    raise last_err
 
 
 if api_key:
     genai.configure(api_key=api_key)
-    model = genai.GenerativeModel('gemini-3.8-flash')
+
+    try:
+        models = get_models(api_key)
+    except Exception as e:
+        st.error(f"مشكلة في المفتاح أو الاتصال: {e}")
+        st.stop()
+
+    default = next((i for i, n in enumerate(models) if "flash" in n and "lite" not in n), 0)
+    model_name = st.selectbox(
+        "اختر النموذج (لو واحد بطيء جرّب غيره):", models, index=default
+    )
 
     uploaded_file = st.file_uploader("اختر ملف PDF", type=["pdf"])
 
@@ -96,32 +122,40 @@ if api_key:
                 if t.strip():
                     pages.append((i, t))
 
+            if not pages:
+                st.error("الملف مفيهوش نص (ممكن يكون صور ممسوحة).")
+                st.stop()
+
             results = {}
             progress = st.progress(0.0)
             status = st.empty()
             done = 0
 
             with ThreadPoolExecutor(max_workers=4) as pool:
-                futures = {pool.submit(translate_page, model, i, t): i for i, t in pages}
+                futures = {
+                    pool.submit(translate_page, model_name, i, t): i for i, t in pages
+                }
                 for fut in as_completed(futures):
                     i = futures[fut]
                     try:
-                        num, text, secs = fut.result()
+                        num, text, secs, tries = fut.result()
                         results[num] = text
-                        status.write(f"✅ سلايد {num + 1} خلص في {secs:.0f} ثانية")
+                        extra = f" (بعد {tries} محاولات)" if tries > 1 else ""
+                        status.write(f"✅ سلايد {num + 1} خلص في {secs:.0f} ثانية{extra}")
                     except Exception as e:
-                        results[i] = None
                         st.error(f"مشكلة في سلايد {i + 1}: {e}")
                     done += 1
                     progress.progress(done / len(pages))
+
+            if not results:
+                st.error("مفيش ولا صفحة اترجمت. جرّب نموذج تاني من القايمة.")
+                st.stop()
 
             out_doc = Document()
             h = out_doc.add_heading('ترجمة المحاضرة', 0)
             make_rtl(h, 20)
 
             for num in sorted(results):
-                if results[num] is None:
-                    continue
                 head = out_doc.add_heading(f'سلايد رقم {num + 1}', level=1)
                 make_rtl(head, 16)
                 for line in results[num].split('\n'):
@@ -130,10 +164,10 @@ if api_key:
 
             bio = io.BytesIO()
             out_doc.save(bio)
-            st.success("تمت الترجمة بنجاح! 🎉")
+            st.success(f"تمت ترجمة {len(results)} من {len(pages)} صفحة 🎉")
             st.download_button(
                 "📥 تحميل ملف الترجمة",
                 bio.getvalue(),
                 "Translated_Clean.docx",
                 "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
-            )
+    )
