@@ -15,8 +15,9 @@ import requests
 st.set_page_config(page_title="المترجم العلمي للمحاضرات", page_icon="🔬")
 st.title("🔬 أدوات المحاضرات العلمية")
 
-provider = st.radio("اختر المزوّد:", ["Claude", "Gemini"], horizontal=True)
-KEY_NAME = "ANTHROPIC_API_KEY" if provider == "Claude" else "GEMINI_API_KEY"
+provider = st.radio("اختر المزوّد:", ["Gemini", "Claude", "Groq"], horizontal=True)
+KEY_NAMES = {"Gemini": "GEMINI_API_KEY", "Claude": "ANTHROPIC_API_KEY", "Groq": "GROQ_API_KEY"}
+KEY_NAME = KEY_NAMES[provider]
 
 try:
     api_key = st.secrets.get(KEY_NAME, "")
@@ -27,7 +28,6 @@ if not api_key:
 
 PAGES_PER_REQUEST = 2
 WORKERS = 2
-MAX_QUIZ_CHARS = 40000
 FONT_DIR = "fonts"
 FONT_FILE = "Amiri-Regular.ttf"
 FONT_URLS = [
@@ -35,6 +35,13 @@ FONT_URLS = [
     "https://raw.githubusercontent.com/google/fonts/main/ofl/amiri/Amiri-Regular.ttf",
 ]
 CLAUDE_FALLBACK = ["claude-sonnet-5-5", "claude-haiku-5-5", "claude-opus-5-5"]
+GROQ_URL = "https://api.groq.com/openai/v1"
+
+
+def text_budget(provider, normal=40000):
+    """أقصى عدد حروف نبعته في الطلب (Groq المجاني حده ضيق)"""
+    return 9000 if provider == "Groq" else normal
+
 
 SYSTEM_PROMPT = """
 أنت مترجم أكاديمي متخصص في الكيمياء والأحياء وعلوم الرياضة.
@@ -59,6 +66,7 @@ EQUATION = re.compile(r'[→⇌=+<>]')
 BAD_WORDS = ["robotics", "tts", "image", "live", "embedding", "audio", "computer",
              "aqa", "imagen", "veo", "lyria", "deep-research", "learnlm", "gemma",
              "vision", "thinking-exp"]
+GROQ_BAD = ["whisper", "guard", "tts", "orpheus", "playai", "safeguard", "embed"]
 
 
 # ---------------------------------------------------------------- أدوات عامة
@@ -66,6 +74,10 @@ def clean_markdown(text):
     text = re.sub(r'\*+(.*?)\*+', r'\1', text)
     text = re.sub(r'#+\s*', '', text)
     return text.strip()
+
+
+def esc(text):
+    return html.escape(str(text)).replace("\n", "<br>")
 
 
 @st.cache_resource(show_spinner="بنزّل الخط العربي...")
@@ -98,6 +110,25 @@ def get_models(provider, key):
 
         def rank(n):
             return 0 if "sonnet" in n else (1 if "haiku" in n else 2)
+        return sorted(names, key=lambda n: (rank(n), n))
+
+    if provider == "Groq":
+        r = requests.get(f"{GROQ_URL}/models",
+                         headers={"Authorization": f"Bearer {key}"}, timeout=30)
+        if r.status_code != 200:
+            raise RuntimeError(f"Groq: {r.status_code} {r.text[:150]}")
+        names = [m["id"] for m in r.json().get("data", [])
+                 if not any(b in m["id"].lower() for b in GROQ_BAD)]
+
+        def rank(n):
+            n = n.lower()
+            if "gpt-oss-120b" in n:
+                return 0
+            if "llama-3.3-70b" in n:
+                return 1
+            if "qwen" in n:
+                return 2
+            return 3
         return sorted(names, key=lambda n: (rank(n), n))
 
     genai.configure(api_key=key)
@@ -150,29 +181,89 @@ def ask_claude(model_name, items, system):
     return "".join(b.text for b in r.content if b.type == "text")
 
 
+def ask_groq(model_name, items, system):
+    # Groq (المجاني) نصي فقط: الصور بتتجاهل
+    text = "\n\n".join(d for k, d in items if k == "text")
+    payload = {
+        "model": model_name,
+        "temperature": 0.2,
+        "max_tokens": 3500,
+        "messages": [{"role": "system", "content": system},
+                     {"role": "user", "content": text}],
+    }
+    if "gpt-oss" in model_name.lower():
+        payload["reasoning_effort"] = "low"
+    r = requests.post(f"{GROQ_URL}/chat/completions",
+                      headers={"Authorization": f"Bearer {api_key}"},
+                      json=payload, timeout=150)
+    if r.status_code != 200:
+        raise RuntimeError(f"{r.status_code} {r.text[:400]}")
+    return r.json()["choices"][0]["message"].get("content") or ""
+
+
+def parse_delay(msg):
+    m = re.search(r'(?:retry|try again) in\s+((?:\d+h)?(?:\d+m)?(?:\d+(?:\.\d+)?s)?)', msg)
+    if not m or not m.group(1):
+        return None
+    g = m.group(1)
+    total = 0.0
+    for pat, mult in ((r'(\d+)h', 3600), (r'(\d+)m', 60), (r'(\d+(?:\.\d+)?)s', 1)):
+        x = re.search(pat, g)
+        if x:
+            total += float(x.group(1)) * mult
+    return total
+
+
 def call_model(provider, model_name, items, system=SYSTEM_PROMPT):
     for attempt in range(5):
         try:
             if provider == "Claude":
                 return ask_claude(model_name, items, system)
+            if provider == "Groq":
+                return ask_groq(model_name, items, system)
             return ask_gemini(model_name, items, system)
         except Exception as e:
             msg = str(e)
+            low = msg.lower()
             if "limit: 0" in msg:
                 raise RuntimeError("النموذج ده مش متاح في الباقة المجانية، اختار نموذج تاني من القايمة.")
-            if "credit balance" in msg.lower():
+            if "credit balance" in low:
                 raise RuntimeError("رصيد Claude خلص، اشحن الحساب من console.anthropic.com.")
-            if "401" in msg or "authentication" in msg.lower():
+            if "401" in msg or "authentication" in low or "invalid api key" in low:
                 raise RuntimeError("المفتاح غلط أو منتهي.")
-            if "429" in msg or "rate_limit" in msg.lower() or "overloaded" in msg.lower():
-                m = re.search(r'retry in (\d+(?:\.\d+)?)s', msg)
-                delay = float(m.group(1)) if m else 30
-                time.sleep(min(delay + 2, 75))
+            if "413" in msg or "request too large" in low:
+                raise RuntimeError("الملف كبير على حد المزوّد المجاني. قسّم الملف لأجزاء أصغر أو استخدم Gemini.")
+            if "429" in msg or "rate_limit" in low or "rate limit" in low or "overloaded" in low:
+                delay = parse_delay(msg)
+                if delay is not None and delay > 90:
+                    raise RuntimeError(
+                        f"وصلت للحد اليومي لهذا النموذج. جرّب نموذج تاني أو ارجع بعد {delay / 3600:.1f} ساعة تقريبًا.")
+                time.sleep(min((delay or 30) + 2, 90))
                 continue
             if attempt == 4:
                 raise RuntimeError(msg[:200])
             time.sleep(3)
     raise RuntimeError("وصلت لحد الاستخدام، استنى دقيقة وجرّب تاني.")
+
+
+def detect_lang(text):
+    """يحدد لغة المحاضرة: عربي أو إنجليزي (أو غيره)"""
+    sample = text[:6000]
+    ar = len(re.findall(r'[\u0600-\u06FF]', sample))
+    lat = len(re.findall(r'[A-Za-z]', sample))
+    if ar > lat:
+        return "Arabic", True
+    return "the same language as the text (for example English)", False
+
+
+def parse_json_block(raw):
+    raw = raw.strip()
+    raw = re.sub(r'^```(?:json)?', '', raw).strip()
+    raw = re.sub(r'```$', '', raw).strip()
+    a, b = raw.find('{'), raw.rfind('}')
+    if a == -1 or b == -1:
+        raise ValueError("الرد مش JSON")
+    return json.loads(raw[a:b + 1])
 
 
 # ---------------------------------------------------------------- الترجمة
@@ -250,6 +341,9 @@ def build_pdf(src_doc, results):
 
 def translate_tab(provider, model_name):
     st.write("ارفع ملف الـ PDF، وهتاخد PDF جديد فيه السلايد الأصلي + الترجمة تحته.")
+    if provider == "Groq":
+        st.info("Groq بيقرأ النص بس ومبيشوفش صور السلايدات، فشرح الرسومات هيبقى أضعف. "
+                "الأفضل للترجمة Gemini.")
     uploaded_file = st.file_uploader("اختر ملف PDF", type=["pdf"], key="tr_pdf")
     if uploaded_file is None or not st.button("ابدأ الترجمة 🚀"):
         return
@@ -274,8 +368,9 @@ def translate_tab(provider, model_name):
     progress = st.progress(0.0)
     status = st.empty()
     done = 0
+    workers = 1 if provider == "Groq" else WORKERS
 
-    with ThreadPoolExecutor(max_workers=WORKERS) as pool:
+    with ThreadPoolExecutor(max_workers=workers) as pool:
         futures = {pool.submit(translate_chunk, provider, model_name, c): c
                    for c in chunks}
         for fut in as_completed(futures):
@@ -350,24 +445,8 @@ Rules:
 """
 
 
-def detect_lang(text):
-    """يحدد لغة المحاضرة: عربي أو إنجليزي (أو غيره)"""
-    sample = text[:6000]
-    ar = len(re.findall(r'[\u0600-\u06FF]', sample))
-    lat = len(re.findall(r'[A-Za-z]', sample))
-    if ar > lat:
-        return "Arabic", True
-    return "the same language as the text (for example English)", False
-
-
 def parse_quiz(raw):
-    raw = raw.strip()
-    raw = re.sub(r'^```(?:json)?', '', raw).strip()
-    raw = re.sub(r'```$', '', raw).strip()
-    a, b = raw.find('{'), raw.rfind('}')
-    if a == -1 or b == -1:
-        raise ValueError("الرد مش JSON")
-    data = json.loads(raw[a:b + 1])
+    data = parse_json_block(raw)
     quiz = []
     for item in data.get("questions", []):
         q = str(item.get("q", "")).strip()
@@ -428,9 +507,11 @@ def quiz_tab(provider, model_name):
         if not text.strip():
             st.error("الملف مفيهوش نص (ممكن يكون صور ممسوحة).")
             return
-        if len(text) > MAX_QUIZ_CHARS:
-            text = text[:MAX_QUIZ_CHARS]
-            st.info("الملف طويل، فالكويز مبني على أول جزء منه.")
+        limit = text_budget(provider)
+        if len(text) > limit:
+            text = text[:limit]
+            st.info("الملف طويل على حد المزوّد، فالكويز مبني على أول جزء منه. "
+                    "لو عايز الملف كله استخدم Gemini.")
 
         lang_name, rtl = detect_lang(text)
         with st.spinner("بجهّز الأسئلة..."):
@@ -442,7 +523,7 @@ def quiz_tab(provider, model_name):
                 st.session_state.submitted = False
                 st.session_state.attempt = st.session_state.get("attempt", 0) + 1
             except Exception as e:
-                st.error(f"معرفتش أجهّز الكويز: {str(e)[:200]}. جرّب تاني أو غيّر النموذج.")
+                st.error(f"معرفتش أجهّز الكويز: {str(e)[:250]}. جرّب تاني أو غيّر النموذج.")
                 return
 
     quiz = st.session_state.get("quiz")
@@ -504,6 +585,165 @@ def quiz_tab(provider, model_name):
             st.rerun()
 
 
+# ---------------------------------------------------------------- متنبئ الامتحان
+PRED_SCHEMA = (
+    '{"style":"2-4 sentences describing the instructor exam style",'
+    '"topics":[{"name":"topic","likelihood":"high","reason":"one short sentence"}],'
+    '"tips":["short study tip"],'
+    '"exam":[{"type":"mcq","q":"question","options":["a","b","c","d"],'
+    '"answer":"the correct option text","explanation":"one short sentence"}]}'
+)
+
+
+def make_predict_prompt(n, lang_name):
+    return f"""
+You are an experienced university professor in chemistry, biology and sports science.
+You will receive two parts of text:
+A) PAST EXAMS of the same instructor (may be empty).
+B) LECTURE material for the coming exam.
+
+Your tasks:
+1. Analyze the instructor's style from the past exams: question types, difficulty, wording style,
+   and which topics appear most. If no past exams are given, say that in "style" and use a general university exam style.
+2. List 5 to 8 topics from the lectures that are most likely to appear, with likelihood "high", "medium" or "low"
+   and a one-sentence reason (for example: asked before, heavily emphasized, or not covered by past exams yet).
+   This is only an educated estimate, never a guarantee.
+3. Give 3 to 5 short study tips based on the analysis.
+4. Write a mock exam of exactly {n} questions imitating the instructor's style and mixing the same question types.
+   Question "type" is one of: "mcq" (exactly 4 options, "answer" = the exact text of the correct option),
+   "tf" (options exactly ["True","False"], "answer" = "True" or "False"),
+   "short" or "problem" (options = [], "answer" = a model answer; for problems show the steps).
+
+LANGUAGE (important): write everything in the SAME language as the lecture text ({lang_name}).
+Do NOT translate to another language. Keep formulas, symbols and units as in the lecture (Unicode subscripts like H₂O).
+No Markdown. Output valid JSON only, no text before or after, no ``` fences, in this shape:
+{PRED_SCHEMA}
+"""
+
+
+def read_pdfs(files):
+    parts = []
+    for f in files:
+        doc = fitz.open(stream=f.read(), filetype="pdf")
+        for i in range(len(doc)):
+            t = doc.load_page(i).get_text().strip()
+            if t:
+                parts.append(f"--- {f.name} / page {i + 1} ---\n{t}")
+    return "\n\n".join(parts)
+
+
+def parse_prediction(raw):
+    data = parse_json_block(raw)
+    exam = []
+    for q in data.get("exam", []):
+        if not str(q.get("q", "")).strip():
+            continue
+        exam.append({
+            "type": str(q.get("type", "short")).lower(),
+            "q": str(q.get("q", "")).strip(),
+            "options": [str(o) for o in q.get("options", [])],
+            "answer": str(q.get("answer", "")).strip(),
+            "explanation": str(q.get("explanation", "")).strip(),
+        })
+    if not exam and not data.get("topics"):
+        raise ValueError("الرد فاضي")
+    data["exam"] = exam
+    return data
+
+
+def render_prediction(data, rtl):
+    d = "rtl" if rtl else "ltr"
+    a = "right" if rtl else "left"
+    st.markdown(f"""<style>
+.pbox {{ direction:{d}; text-align:{a}; line-height:1.8; margin:4px 0 8px 0; }}
+.pq {{ direction:{d}; text-align:{a}; font-weight:600; margin-top:16px; }}
+</style>""", unsafe_allow_html=True)
+    show = "إظهار الإجابة" if rtl else "Show answer"
+    icons = {"high": "🔴", "medium": "🟠", "low": "🟢"}
+
+    if data.get("style"):
+        st.subheader("🧭 أسلوب الدكتور")
+        st.markdown(f'<div class="pbox">{esc(data["style"])}</div>', unsafe_allow_html=True)
+
+    topics = data.get("topics", [])
+    if topics:
+        st.subheader("🎯 المواضيع المتوقعة")
+        for t in topics:
+            icon = icons.get(str(t.get("likelihood", "")).lower(), "⚪")
+            st.markdown(
+                f'<div class="pbox">{icon} <b>{esc(t.get("name", ""))}</b>'
+                f' — {esc(t.get("reason", ""))}</div>', unsafe_allow_html=True)
+        st.caption("🔴 احتمال عالي   🟠 متوسط   🟢 أقل. ده تقدير مش ضمان.")
+
+    tips = data.get("tips", [])
+    if tips:
+        st.subheader("💡 نصايح للمذاكرة")
+        for tip in tips:
+            st.markdown(f'<div class="pbox">• {esc(tip)}</div>', unsafe_allow_html=True)
+
+    exam = data.get("exam", [])
+    if exam:
+        st.subheader("📝 امتحان تجريبي بأسلوب الدكتور")
+        for i, q in enumerate(exam):
+            st.markdown(f'<div class="pq">{i + 1}. {esc(q["q"])}</div>', unsafe_allow_html=True)
+            if q["options"]:
+                opts = "<br>".join(f"{chr(65 + k)}) {esc(o)}" for k, o in enumerate(q["options"]))
+                st.markdown(f'<div class="pbox">{opts}</div>', unsafe_allow_html=True)
+            with st.expander(show):
+                body = esc(q["answer"])
+                if q["explanation"]:
+                    body += "<br><br>" + esc(q["explanation"])
+                st.markdown(f'<div class="pbox">{body}</div>', unsafe_allow_html=True)
+
+
+def predict_tab(provider, model_name):
+    st.write("ارفع امتحانات سنين فاتت + المحاضرات، وهتحلل أسلوب الدكتور وتطلعلك "
+             "المواضيع المتوقعة وامتحان تجريبي بنفس أسلوبه.")
+    exams = st.file_uploader("امتحانات سابقة (PDF) — اختياري لكن بيحسّن التنبؤ",
+                             type=["pdf"], accept_multiple_files=True, key="pred_exams")
+    lects = st.file_uploader("المحاضرات (PDF)", type=["pdf"],
+                             accept_multiple_files=True, key="pred_lects")
+    n = st.slider("عدد أسئلة الامتحان التجريبي", 5, 20, 10, key="pred_n")
+
+    if lects and st.button("حلّل وتنبّأ 🔮"):
+        lect_text = read_pdfs(lects)
+        exam_text = read_pdfs(exams) if exams else ""
+        if not lect_text.strip():
+            st.error("المحاضرات مفيهاش نص (ممكن تكون صور ممسوحة).")
+            return
+
+        budget = text_budget(provider, 60000)
+        exam_budget = int(budget * 0.4) if exam_text else 0
+        lect_budget = budget - exam_budget
+        if len(exam_text) > exam_budget and exam_text:
+            exam_text = exam_text[:exam_budget]
+            st.info("الامتحانات طويلة، فاتحلل أول جزء منها.")
+        if len(lect_text) > lect_budget:
+            lect_text = lect_text[:lect_budget]
+            st.info("المحاضرات طويلة على حد المزوّد، فاتحلل أول جزء منها. "
+                    "لو عايزها كلها استخدم Gemini.")
+
+        lang_name, rtl = detect_lang(lect_text)
+        payload = (f"=== PAST EXAMS ===\n{exam_text or '(none provided)'}\n\n"
+                   f"=== LECTURES ===\n{lect_text}")
+        with st.spinner("بحلل الامتحانات والمحاضرات..."):
+            try:
+                raw = call_model(provider, model_name, [("text", payload)],
+                                 system=make_predict_prompt(n, lang_name))
+                st.session_state.pred = (parse_prediction(raw), rtl)
+            except Exception as e:
+                st.error(f"معرفتش أكمل: {str(e)[:250]}. جرّب تاني أو غيّر النموذج.")
+                return
+
+    pred = st.session_state.get("pred")
+    if pred:
+        st.divider()
+        render_prediction(pred[0], pred[1])
+        if st.button("🗑️ امسح النتيجة"):
+            st.session_state.pop("pred", None)
+            st.rerun()
+
+
 # ---------------------------------------------------------------- التشغيل
 if api_key:
     if provider == "Gemini":
@@ -525,8 +765,10 @@ if api_key:
 
     model_name = st.selectbox("اختر النموذج:", models, index=0)
 
-    tab1, tab2 = st.tabs(["🌐 الترجمة", "🧠 كويز تفاعلي"])
+    tab1, tab2, tab3 = st.tabs(["🌐 الترجمة", "🧠 كويز تفاعلي", "🔮 متنبئ الامتحان"])
     with tab1:
         translate_tab(provider, model_name)
     with tab2:
         quiz_tab(provider, model_name)
+    with tab3:
+        predict_tab(provider, model_name)
