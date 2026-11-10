@@ -313,35 +313,51 @@ def translate_tab(provider, model_name):
 
 # ---------------------------------------------------------------- الكويز
 QUIZ_JSON_EXAMPLE = (
-    '{"questions":[{"q":"نص السؤال","options":["الخيار 1","الخيار 2","الخيار 3","الخيار 4"],'
-    '"answer":0,"explanation":"شرح قصير للإجابة الصحيحة"}]}'
+    '{"questions":[{"q":"question text","options":["option 1","option 2","option 3","option 4"],'
+    '"answer":0,"explanation":"short explanation of the correct answer"}]}'
 )
 
 
-def make_quiz_prompt(n, level, qtype):
+def make_quiz_prompt(n, level, qtype, lang_name):
     if qtype == "اختيار من متعدد":
-        kind = "كل الأسئلة اختيار من متعدد، لكل سؤال 4 خيارات."
+        kind = "All questions are multiple choice with exactly 4 options each."
     elif qtype == "صح وخطأ":
-        kind = 'كل الأسئلة صح وخطأ، والخياران دائمًا بالضبط: ["صح","خطأ"].'
+        kind = ('All questions are true/false. The two options must be exactly '
+                '["True","False"] (translated to the lecture language).')
     else:
-        kind = ('مزيج: حوالي 70% اختيار من متعدد (4 خيارات) و30% صح وخطأ '
-                '(الخياران بالضبط ["صح","خطأ"]).')
+        kind = ("A mix: about 70% multiple choice (4 options) and 30% true/false "
+                "(two options: True and False, in the lecture language).")
     return f"""
-أنت أستاذ جامعي متخصص في الكيمياء والأحياء وعلوم الرياضة. ستستلم نص محاضرة، وعليك إنشاء كويز منها.
-القواعد:
-1. عدد الأسئلة بالضبط {n}.
+You are a university professor specialized in chemistry, biology and sports science.
+You will receive the text of a lecture. Create a quiz from it.
+
+LANGUAGE (most important rule):
+- Write the questions, options and explanations in the SAME language as the lecture text ({lang_name}).
+- Do NOT translate the lecture to any other language. If the lecture is English, the whole quiz is English.
+- Keep chemical formulas, symbols and units as in the lecture (use Unicode subscripts like H₂O, CO₂, k₀).
+
+Rules:
+1. Exactly {n} questions.
 2. {kind}
-3. مستوى الصعوبة: {level}.
-4. اكتب الأسئلة والخيارات والشرح بالعربية، مع كتابة المصطلحات العلمية بالإنجليزية بين قوسين.
-5. اترك المعادلات والرموز والوحدات بالإنجليزية بصيغة Unicode مثل H₂O و CO₂ و k₀.
-6. كل سؤال له إجابة صحيحة واحدة فقط، والخيارات الخاطئة تكون مقنعة وليست سخيفة.
-7. الأسئلة من محتوى المحاضرة فقط، وتغطي أجزاءها المختلفة وليس أول صفحة فقط. ركّز على الفهم وليس الحفظ الحرفي.
-8. الشرح جملة أو جملتان فقط، ويوضح لماذا الإجابة صحيحة.
-9. لا تستخدم Markdown نهائيًا.
-10. "answer" هو رقم الخيار الصحيح بدءًا من 0.
-11. أخرج JSON صالح فقط بدون أي كلام قبله أو بعده وبدون علامات ```، بهذا الشكل:
+3. Difficulty: {level}.
+4. Exactly one correct answer per question. Wrong options must be plausible, not silly.
+5. Questions must come from the lecture content only and cover its different parts, not just the first page. Focus on understanding, not word-for-word memorization.
+6. Explanation: one or two sentences saying why the answer is correct.
+7. No Markdown.
+8. "answer" is the index of the correct option, starting from 0.
+9. Output valid JSON only, no text before or after, no ``` fences, in this shape:
 {QUIZ_JSON_EXAMPLE}
 """
+
+
+def detect_lang(text):
+    """يحدد لغة المحاضرة: عربي أو إنجليزي (أو غيره)"""
+    sample = text[:6000]
+    ar = len(re.findall(r'[\u0600-\u06FF]', sample))
+    lat = len(re.findall(r'[A-Za-z]', sample))
+    if ar > lat:
+        return "Arabic", True
+    return "the same language as the text (for example English)", False
 
 
 def parse_quiz(raw):
@@ -360,10 +376,8 @@ def parse_quiz(raw):
         if not q or len(opts) < 2 or not isinstance(ans, int) or not (0 <= ans < len(opts)):
             continue
         correct = opts[ans]
-        if set(opts) != {"صح", "خطأ"}:
-            random.shuffle(opts)       # نغيّر ترتيب الخيارات عشان الإجابة متبقاش دايمًا في نفس المكان
-        else:
-            opts = ["صح", "خطأ"]
+        if len(opts) > 2:          # اختيار من متعدد: نخلط الترتيب. صح/خطأ: نسيبه زي ما هو
+            random.shuffle(opts)
         quiz.append({
             "q": q,
             "options": opts,
@@ -375,28 +389,31 @@ def parse_quiz(raw):
     return quiz
 
 
-QUIZ_CSS = """
+def quiz_css(rtl):
+    d = "rtl" if rtl else "ltr"
+    a = "right" if rtl else "left"
+    return f"""
 <style>
-[class*="st-key-quizq"] { direction: rtl; text-align: right; }
-.qbox { direction: rtl; text-align: right; font-size: 1.05rem;
-        font-weight: 600; margin: 18px 0 4px 0; }
-.rbox { direction: rtl; text-align: right; padding: 10px 14px;
-        border-radius: 10px; margin: 4px 0 10px 0; line-height: 1.7; }
-.ok  { background: rgba(46,160,67,.18); }
-.bad { background: rgba(218,54,51,.18); }
-.skip{ background: rgba(150,150,150,.18); }
+[class*="st-key-quizq"] {{ direction: {d}; text-align: {a}; }}
+.qbox {{ direction: {d}; text-align: {a}; font-size: 1.05rem;
+        font-weight: 600; margin: 18px 0 4px 0; }}
+.rbox {{ direction: {d}; text-align: {a}; padding: 10px 14px;
+        border-radius: 10px; margin: 4px 0 10px 0; line-height: 1.7; }}
+.ok  {{ background: rgba(46,160,67,.18); }}
+.bad {{ background: rgba(218,54,51,.18); }}
+.skip{{ background: rgba(150,150,150,.18); }}
 </style>
 """
 
 
 def quiz_tab(provider, model_name):
-    st.markdown(QUIZ_CSS, unsafe_allow_html=True)
-    st.write("ارفع المحاضرة وهتطلعلك أسئلة تجاوب عليها وتشوف درجتك.")
+    st.write("ارفع المحاضرة وهتطلعلك أسئلة بنفس لغة السلايد، تجاوب عليها وتشوف درجتك.")
 
     uploaded = st.file_uploader("اختر ملف PDF للكويز", type=["pdf"], key="quiz_pdf")
     c1, c2 = st.columns(2)
     n = c1.slider("عدد الأسئلة", 5, 20, 10)
     level = c2.selectbox("المستوى", ["سهل", "متوسط", "صعب"], index=1)
+    level_en = {"سهل": "easy", "متوسط": "medium", "صعب": "hard"}[level]
     qtype = st.radio("نوع الأسئلة", ["اختيار من متعدد", "صح وخطأ", "مختلط"],
                      horizontal=True, key="qtype")
 
@@ -406,7 +423,7 @@ def quiz_tab(provider, model_name):
         for i in range(len(doc)):
             t = doc.load_page(i).get_text().strip()
             if t:
-                parts.append(f"--- سلايد {i + 1} ---\n{t}")
+                parts.append(f"--- Slide {i + 1} ---\n{t}")
         text = "\n\n".join(parts)
         if not text.strip():
             st.error("الملف مفيهوش نص (ممكن يكون صور ممسوحة).")
@@ -414,11 +431,14 @@ def quiz_tab(provider, model_name):
         if len(text) > MAX_QUIZ_CHARS:
             text = text[:MAX_QUIZ_CHARS]
             st.info("الملف طويل، فالكويز مبني على أول جزء منه.")
+
+        lang_name, rtl = detect_lang(text)
         with st.spinner("بجهّز الأسئلة..."):
             try:
                 raw = call_model(provider, model_name, [("text", text)],
-                                 system=make_quiz_prompt(n, level, qtype))
+                                 system=make_quiz_prompt(n, level_en, qtype, lang_name))
                 st.session_state.quiz = parse_quiz(raw)
+                st.session_state.quiz_rtl = rtl
                 st.session_state.submitted = False
                 st.session_state.attempt = st.session_state.get("attempt", 0) + 1
             except Exception as e:
@@ -429,6 +449,8 @@ def quiz_tab(provider, model_name):
     if not quiz:
         return
 
+    rtl = st.session_state.get("quiz_rtl", False)
+    st.markdown(quiz_css(rtl), unsafe_allow_html=True)
     attempt = st.session_state.get("attempt", 1)
     submitted = st.session_state.get("submitted", False)
     st.divider()
@@ -438,7 +460,7 @@ def quiz_tab(provider, model_name):
         st.markdown(f'<div class="qbox">{i + 1}. {html.escape(item["q"])}</div>',
                     unsafe_allow_html=True)
         choice = st.radio(
-            f"سؤال {i + 1}", item["options"], index=None,
+            f"Question {i + 1}", item["options"], index=None,
             key=f"quizq_{attempt}_{i}", disabled=submitted,
             label_visibility="collapsed",
         )
@@ -447,14 +469,16 @@ def quiz_tab(provider, model_name):
         if submitted:
             correct = item["options"][item["answer"]]
             if choice is None:
-                css, icon, head = "skip", "⏭️", "لم تجب"
+                css, icon, head = "skip", "⏭️", "Not answered" if not rtl else "لم تجب"
             elif choice == correct:
-                css, icon, head = "ok", "✅", "إجابة صحيحة"
+                css, icon, head = "ok", "✅", "Correct" if not rtl else "إجابة صحيحة"
             else:
-                css, icon, head = "bad", "❌", f"إجابتك: {html.escape(choice)}"
+                label = "Your answer" if not rtl else "إجابتك"
+                css, icon, head = "bad", "❌", f"{label}: {html.escape(choice)}"
             body = f"{icon} {head}"
             if choice != correct:
-                body += f"<br>الإجابة الصحيحة: <b>{html.escape(correct)}</b>"
+                label = "Correct answer" if not rtl else "الإجابة الصحيحة"
+                body += f"<br>{label}: <b>{html.escape(correct)}</b>"
             if item["explanation"]:
                 body += f"<br>{html.escape(item['explanation'])}"
             st.markdown(f'<div class="rbox {css}">{body}</div>', unsafe_allow_html=True)
