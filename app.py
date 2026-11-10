@@ -36,6 +36,7 @@ FONT_URLS = [
 ]
 CLAUDE_FALLBACK = ["claude-sonnet-5-5", "claude-haiku-5-5", "claude-opus-5-5"]
 GROQ_URL = "https://api.groq.com/openai/v1"
+SRC_TYPES = ["pdf", "png", "jpg", "jpeg"]
 
 
 def text_budget(provider, normal=40000):
@@ -59,6 +60,32 @@ SYSTEM_PROMPT = """
 7. لا تستخدم أي رموز Markdown مثل ** أو ###. اكتب كل بند في سطر مستقل.
 8. اكتب الترجمة فقط بدون أي مقدمة.
 9. كل سلايد يبدأ بسطر على شكل ===PAGE رقم=== . اكتب نفس هذا السطر بالضبط قبل ترجمة كل سلايد.
+"""
+
+OCR_PROMPT = """
+You are an expert OCR reader for chemistry and science study material.
+You receive photos or scans of lecture slides or exam papers (they may be rotated, skewed or taken at an angle).
+Rules:
+1. Transcribe ALL printed and handwritten text exactly as written, keeping the original language, numbering and question order.
+2. Write formulas with Unicode (H₂O, CO₂, k₀).
+3. For every chemical structure, Newman/Fischer projection, graph, diagram or table, add a short description in square brackets at the place where it appears,
+   for example [Compound A: Newman projection with OH, F, H on the front carbon].
+4. Each image starts with a line like ===IMAGE n===. Keep these separator lines.
+5. Output only the transcription, no comments.
+"""
+
+SOLVE_PROMPT = """
+You are a university professor of organic chemistry and stereochemistry.
+You receive photos or scans of an exam paper (they may be rotated, skewed, or include structures, Newman or Fischer projections, tables).
+Instructions:
+1. Read every question carefully. For structure questions, analyze the drawing step by step
+   (for example CIP priorities for R/S and E/Z) before you answer.
+2. For each question give: the question number, the answer, and a one or two sentence reason.
+3. If a question or a drawing is unreadable or ambiguous, say so clearly instead of guessing.
+4. Write the reasons in {expl_lang}. Keep technical terms and the answer letters/words as in the exam.
+5. No Markdown. Use exactly this format for every question, one block per question:
+Q1) Answer: ... | Reason: ...
+6. Output only the answers, no introduction.
 """
 
 ARABIC = re.compile(r'[\u0600-\u06FF]')
@@ -148,7 +175,8 @@ def get_models(provider, key):
     return sorted(names, key=lambda n: (rank(n), n))
 
 
-def ask_gemini(model_name, items, system):
+def ask_gemini(model_name, items, system, key):
+    genai.configure(api_key=key)
     model = genai.GenerativeModel(model_name)
     content = [system]
     for kind, data in items:
@@ -161,8 +189,8 @@ def ask_gemini(model_name, items, system):
     return r.text
 
 
-def ask_claude(model_name, items, system):
-    client = anthropic.Anthropic(api_key=api_key, max_retries=0, timeout=150)
+def ask_claude(model_name, items, system, key):
+    client = anthropic.Anthropic(api_key=key, max_retries=0, timeout=150)
     content = []
     for kind, data in items:
         if kind == "image":
@@ -181,7 +209,7 @@ def ask_claude(model_name, items, system):
     return "".join(b.text for b in r.content if b.type == "text")
 
 
-def ask_groq(model_name, items, system):
+def ask_groq(model_name, items, system, key):
     # Groq (المجاني) نصي فقط: الصور بتتجاهل
     text = "\n\n".join(d for k, d in items if k == "text")
     payload = {
@@ -194,7 +222,7 @@ def ask_groq(model_name, items, system):
     if "gpt-oss" in model_name.lower():
         payload["reasoning_effort"] = "low"
     r = requests.post(f"{GROQ_URL}/chat/completions",
-                      headers={"Authorization": f"Bearer {api_key}"},
+                      headers={"Authorization": f"Bearer {key}"},
                       json=payload, timeout=150)
     if r.status_code != 200:
         raise RuntimeError(f"{r.status_code} {r.text[:400]}")
@@ -214,14 +242,15 @@ def parse_delay(msg):
     return total
 
 
-def call_model(provider, model_name, items, system=SYSTEM_PROMPT):
+def call_model(provider, model_name, items, system=SYSTEM_PROMPT, key=None):
+    key = key or api_key
     for attempt in range(5):
         try:
             if provider == "Claude":
-                return ask_claude(model_name, items, system)
+                return ask_claude(model_name, items, system, key)
             if provider == "Groq":
-                return ask_groq(model_name, items, system)
-            return ask_gemini(model_name, items, system)
+                return ask_groq(model_name, items, system, key)
+            return ask_gemini(model_name, items, system, key)
         except Exception as e:
             msg = str(e)
             low = msg.lower()
@@ -264,6 +293,85 @@ def parse_json_block(raw):
     if a == -1 or b == -1:
         raise ValueError("الرد مش JSON")
     return json.loads(raw[a:b + 1])
+
+
+# ---------------------------------------------------------------- قراءة الصور
+def page_png(pg, max_side=1600):
+    r = pg.rect
+    z = max_side / max(r.width, r.height)
+    return pg.get_pixmap(matrix=fitz.Matrix(z, z)).tobytes("png")
+
+
+def file_to_pngs(f, max_side=1600):
+    """أي ملف (PDF أو صورة) -> قايمة صور PNG"""
+    name = f.name.lower()
+    if name.endswith(".pdf"):
+        doc = fitz.open(stream=f.getvalue(), filetype="pdf")
+        return [page_png(pg, max_side) for pg in doc]
+    ext = name.rsplit(".", 1)[-1]
+    ext = "jpeg" if ext == "jpg" else ext
+    doc = fitz.open(stream=f.getvalue(), filetype=ext)
+    return [page_png(doc[0], max_side)]
+
+
+def get_reader(provider, model_name, key):
+    """مزوّد بيشوف الصور: المختار لو Gemini/Claude، وإلا من Secrets"""
+    if provider in ("Gemini", "Claude"):
+        return provider, model_name, key
+    for prov, kn in (("Gemini", "GEMINI_API_KEY"), ("Claude", "ANTHROPIC_API_KEY")):
+        try:
+            k = st.secrets.get(kn, "")
+        except Exception:
+            k = ""
+        if k:
+            try:
+                ms = get_models(prov, k)
+            except Exception:
+                continue
+            if ms:
+                return prov, ms[0], k
+    return None
+
+
+NO_READER_MSG = ("قراءة الصور بتحتاج Gemini أو Claude. اختار Gemini من فوق، "
+                 "أو ضيف GEMINI_API_KEY في Secrets.")
+
+
+def ocr_images(pngs, reader):
+    prov, model, key = reader
+    out = []
+    for s in range(0, len(pngs), 3):
+        batch = pngs[s:s + 3]
+        items = []
+        for j, p in enumerate(batch):
+            items.append(("text", f"===IMAGE {s + j + 1}==="))
+            items.append(("image", p))
+        out.append(call_model(prov, model, items, system=OCR_PROMPT, key=key))
+    return "\n\n".join(out)
+
+
+def read_sources(files, provider, model_name, key):
+    """نص من ملفات PDF (فيها نص) + صور + PDF ممسوح"""
+    texts, scans = [], []
+    for f in files:
+        name = f.name.lower()
+        if name.endswith(".pdf"):
+            doc = fitz.open(stream=f.getvalue(), filetype="pdf")
+            for i, pg in enumerate(doc):
+                t = pg.get_text().strip()
+                if len(t) >= 40:
+                    texts.append(f"--- {f.name} / page {i + 1} ---\n{t}")
+                else:
+                    scans.append(page_png(pg))
+        else:
+            scans.append(file_to_pngs(f)[0])
+    if scans:
+        reader = get_reader(provider, model_name, key)
+        if not reader:
+            raise RuntimeError(NO_READER_MSG)
+        with st.spinner(f"بقرأ {len(scans)} صورة/صفحة..."):
+            texts.append(ocr_images(scans, reader))
+    return "\n\n".join(texts)
 
 
 # ---------------------------------------------------------------- الترجمة
@@ -486,9 +594,10 @@ def quiz_css(rtl):
 
 
 def quiz_tab(provider, model_name):
-    st.write("ارفع المحاضرة وهتطلعلك أسئلة بنفس لغة السلايد، تجاوب عليها وتشوف درجتك.")
+    st.write("ارفع المحاضرة (PDF أو صور) وهتطلعلك أسئلة بنفس لغة السلايد، تجاوب عليها وتشوف درجتك.")
 
-    uploaded = st.file_uploader("اختر ملف PDF للكويز", type=["pdf"], key="quiz_pdf")
+    uploaded = st.file_uploader("اختر ملفات PDF أو صور للكويز", type=SRC_TYPES,
+                                accept_multiple_files=True, key="quiz_pdf")
     c1, c2 = st.columns(2)
     n = c1.slider("عدد الأسئلة", 5, 20, 10)
     level = c2.selectbox("المستوى", ["سهل", "متوسط", "صعب"], index=1)
@@ -496,16 +605,14 @@ def quiz_tab(provider, model_name):
     qtype = st.radio("نوع الأسئلة", ["اختيار من متعدد", "صح وخطأ", "مختلط"],
                      horizontal=True, key="qtype")
 
-    if uploaded is not None and st.button("ولّد الكويز 🧠"):
-        doc = fitz.open(stream=uploaded.read(), filetype="pdf")
-        parts = []
-        for i in range(len(doc)):
-            t = doc.load_page(i).get_text().strip()
-            if t:
-                parts.append(f"--- Slide {i + 1} ---\n{t}")
-        text = "\n\n".join(parts)
+    if uploaded and st.button("ولّد الكويز 🧠"):
+        try:
+            text = read_sources(uploaded, provider, model_name, api_key)
+        except Exception as e:
+            st.error(str(e)[:250])
+            return
         if not text.strip():
-            st.error("الملف مفيهوش نص (ممكن يكون صور ممسوحة).")
+            st.error("معرفتش أقرأ أي نص من الملفات.")
             return
         limit = text_budget(provider)
         if len(text) > limit:
@@ -621,17 +728,6 @@ No Markdown. Output valid JSON only, no text before or after, no ``` fences, in 
 """
 
 
-def read_pdfs(files):
-    parts = []
-    for f in files:
-        doc = fitz.open(stream=f.read(), filetype="pdf")
-        for i in range(len(doc)):
-            t = doc.load_page(i).get_text().strip()
-            if t:
-                parts.append(f"--- {f.name} / page {i + 1} ---\n{t}")
-    return "\n\n".join(parts)
-
-
 def parse_prediction(raw):
     data = parse_json_block(raw)
     exam = []
@@ -697,19 +793,23 @@ def render_prediction(data, rtl):
 
 
 def predict_tab(provider, model_name):
-    st.write("ارفع امتحانات سنين فاتت + المحاضرات، وهتحلل أسلوب الدكتور وتطلعلك "
+    st.write("ارفع امتحانات سنين فاتت + المحاضرات (PDF أو صور)، وهتحلل أسلوب الدكتور وتطلعلك "
              "المواضيع المتوقعة وامتحان تجريبي بنفس أسلوبه.")
-    exams = st.file_uploader("امتحانات سابقة (PDF) — اختياري لكن بيحسّن التنبؤ",
-                             type=["pdf"], accept_multiple_files=True, key="pred_exams")
-    lects = st.file_uploader("المحاضرات (PDF)", type=["pdf"],
+    exams = st.file_uploader("امتحانات سابقة (PDF أو صور) — اختياري لكن بيحسّن التنبؤ",
+                             type=SRC_TYPES, accept_multiple_files=True, key="pred_exams")
+    lects = st.file_uploader("المحاضرات (PDF أو صور)", type=SRC_TYPES,
                              accept_multiple_files=True, key="pred_lects")
     n = st.slider("عدد أسئلة الامتحان التجريبي", 5, 20, 10, key="pred_n")
 
     if lects and st.button("حلّل وتنبّأ 🔮"):
-        lect_text = read_pdfs(lects)
-        exam_text = read_pdfs(exams) if exams else ""
+        try:
+            lect_text = read_sources(lects, provider, model_name, api_key)
+            exam_text = read_sources(exams, provider, model_name, api_key) if exams else ""
+        except Exception as e:
+            st.error(str(e)[:250])
+            return
         if not lect_text.strip():
-            st.error("المحاضرات مفيهاش نص (ممكن تكون صور ممسوحة).")
+            st.error("معرفتش أقرأ أي نص من المحاضرات.")
             return
 
         budget = text_budget(provider, 60000)
@@ -744,6 +844,54 @@ def predict_tab(provider, model_name):
             st.rerun()
 
 
+# ---------------------------------------------------------------- حل ورقة من صورة
+def solve_tab(provider, model_name):
+    st.write("صوّر ورقة امتحان (أو ارفع PDF ممسوح)، والأداة هتقرأ الأسئلة وتحلها بسبب مختصر. "
+             "مناسبة للأسئلة المرسومة (R/S، E/Z، Newman، Fischer...).")
+    files = st.file_uploader("ورقة الامتحان (صور أو PDF)", type=SRC_TYPES,
+                             accept_multiple_files=True, key="solve_files")
+    expl = st.radio("لغة الشرح", ["العربية", "English"], horizontal=True, key="solve_lang")
+
+    if files and st.button("اقرأ وحُل 📸"):
+        reader = get_reader(provider, model_name, api_key)
+        if not reader:
+            st.error(NO_READER_MSG)
+            return
+        pngs = []
+        for f in files:
+            pngs.extend(file_to_pngs(f, max_side=1800))
+        if len(pngs) > 8:
+            pngs = pngs[:8]
+            st.info("الصور كتير، فهحل أول 8 صفحات بس.")
+
+        prov, model, key = reader
+        items = []
+        for j, p in enumerate(pngs):
+            items.append(("text", f"===IMAGE {j + 1}==="))
+            items.append(("image", p))
+        prompt = SOLVE_PROMPT.format(expl_lang="Arabic" if expl == "العربية" else "English")
+        with st.spinner("بقرأ الورقة وبحل..."):
+            try:
+                st.session_state.solved = (call_model(prov, model, items, system=prompt, key=key),
+                                           expl == "العربية")
+            except Exception as e:
+                st.error(f"معرفتش أكمل: {str(e)[:250]}")
+                return
+
+    solved = st.session_state.get("solved")
+    if solved:
+        text, rtl = solved
+        d = "rtl" if rtl else "ltr"
+        a = "right" if rtl else "left"
+        st.divider()
+        st.warning("راجع الإجابات بنفسك، خصوصًا أسئلة الرسم (R/S وE/Z)، لأن النموذج ممكن يغلط في قراءة الرسومات.")
+        for block in re.split(r'\n\s*\n|\n(?=Q\d+\))', text.strip()):
+            if block.strip():
+                st.markdown(f'<div style="direction:{d};text-align:{a};line-height:1.8;'
+                            f'margin:6px 0">{esc(block.strip())}</div>', unsafe_allow_html=True)
+        st.download_button("📥 تحميل الإجابات (txt)", text, "answers.txt", "text/plain")
+
+
 # ---------------------------------------------------------------- التشغيل
 if api_key:
     if provider == "Gemini":
@@ -765,10 +913,13 @@ if api_key:
 
     model_name = st.selectbox("اختر النموذج:", models, index=0)
 
-    tab1, tab2, tab3 = st.tabs(["🌐 الترجمة", "🧠 كويز تفاعلي", "🔮 متنبئ الامتحان"])
+    tab1, tab2, tab3, tab4 = st.tabs(
+        ["🌐 الترجمة", "🧠 كويز تفاعلي", "🔮 متنبئ الامتحان", "📸 حل ورقة من صورة"])
     with tab1:
         translate_tab(provider, model_name)
     with tab2:
         quiz_tab(provider, model_name)
     with tab3:
         predict_tab(provider, model_name)
+    with tab4:
+        solve_tab(provider, model_name)
