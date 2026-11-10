@@ -1,6 +1,10 @@
 import streamlit as st
 import fitz  # PyMuPDF
 import google.generativeai as genai
+import anthropic
+import base64
+import json
+import random
 from concurrent.futures import ThreadPoolExecutor, as_completed
 import html
 import os
@@ -9,25 +13,28 @@ import time
 import requests
 
 st.set_page_config(page_title="المترجم العلمي للمحاضرات", page_icon="🔬")
-st.title("🔬 مترجم المحاضرات العلمي (كيمياء، بايو، رياضة)")
-st.write("ارفع ملف الـ PDF، وهتاخد PDF جديد فيه السلايد الأصلي + الترجمة تحته.")
+st.title("🔬 أدوات المحاضرات العلمية")
 
-# المفتاح من Secrets، ولو مش موجود يطلبه يدويًا
+provider = st.radio("اختر المزوّد:", ["Claude", "Gemini"], horizontal=True)
+KEY_NAME = "ANTHROPIC_API_KEY" if provider == "Claude" else "GEMINI_API_KEY"
+
 try:
-    api_key = st.secrets.get("GEMINI_API_KEY", "")
+    api_key = st.secrets.get(KEY_NAME, "")
 except Exception:
     api_key = ""
 if not api_key:
-    api_key = st.text_input("أدخل مفتاح Gemini API بتاعك:", type="password")
+    api_key = st.text_input(f"أدخل مفتاح {provider} API بتاعك:", type="password")
 
 PAGES_PER_REQUEST = 2
 WORKERS = 2
+MAX_QUIZ_CHARS = 40000
 FONT_DIR = "fonts"
 FONT_FILE = "Amiri-Regular.ttf"
 FONT_URLS = [
     "https://github.com/google/fonts/raw/main/ofl/amiri/Amiri-Regular.ttf",
     "https://raw.githubusercontent.com/google/fonts/main/ofl/amiri/Amiri-Regular.ttf",
 ]
+CLAUDE_FALLBACK = ["claude-sonnet-5-5", "claude-haiku-5-5", "claude-opus-5-5"]
 
 SYSTEM_PROMPT = """
 أنت مترجم أكاديمي متخصص في الكيمياء والأحياء وعلوم الرياضة.
@@ -54,6 +61,7 @@ BAD_WORDS = ["robotics", "tts", "image", "live", "embedding", "audio", "computer
              "vision", "thinking-exp"]
 
 
+# ---------------------------------------------------------------- أدوات عامة
 def clean_markdown(text):
     text = re.sub(r'\*+(.*?)\*+', r'\1', text)
     text = re.sub(r'#+\s*', '', text)
@@ -79,44 +87,84 @@ def ensure_font():
 
 
 @st.cache_data(show_spinner=False)
-def get_models(key):
+def get_models(provider, key):
+    if provider == "Claude":
+        try:
+            client = anthropic.Anthropic(api_key=key)
+            names = [m.id for m in client.models.list(limit=50).data]
+        except Exception:
+            names = []
+        names = [n for n in names if n.startswith("claude")] or CLAUDE_FALLBACK
+
+        def rank(n):
+            return 0 if "sonnet" in n else (1 if "haiku" in n else 2)
+        return sorted(names, key=lambda n: (rank(n), n))
+
     genai.configure(api_key=key)
     names = []
     for m in genai.list_models():
         n = m.name.replace("models/", "")
         if "generateContent" not in m.supported_generation_methods:
             continue
-        if not n.startswith("gemini"):
-            continue
-        if any(b in n for b in BAD_WORDS):
+        if not n.startswith("gemini") or any(b in n for b in BAD_WORDS):
             continue
         names.append(n)
 
     def rank(n):
         if "flash" in n and "lite" not in n:
             return 0
-        if "flash" in n:
-            return 1
-        return 2
-
+        return 1 if "flash" in n else 2
     return sorted(names, key=lambda n: (rank(n), n))
 
 
-def call_model(model_name, content):
+def ask_gemini(model_name, items, system):
     model = genai.GenerativeModel(model_name)
+    content = [system]
+    for kind, data in items:
+        content.append({"mime_type": "image/png", "data": data} if kind == "image" else data)
+    r = model.generate_content(
+        content,
+        generation_config={"temperature": 0.2},
+        request_options={"timeout": 150, "retry": None},
+    )
+    return r.text
+
+
+def ask_claude(model_name, items, system):
+    client = anthropic.Anthropic(api_key=api_key, max_retries=0, timeout=150)
+    content = []
+    for kind, data in items:
+        if kind == "image":
+            content.append({"type": "image", "source": {
+                "type": "base64", "media_type": "image/png",
+                "data": base64.b64encode(data).decode()}})
+        else:
+            content.append({"type": "text", "text": data})
+    r = client.messages.create(
+        model=model_name,
+        max_tokens=8000,
+        temperature=0.2,
+        system=system,
+        messages=[{"role": "user", "content": content}],
+    )
+    return "".join(b.text for b in r.content if b.type == "text")
+
+
+def call_model(provider, model_name, items, system=SYSTEM_PROMPT):
     for attempt in range(5):
         try:
-            r = model.generate_content(
-                content,
-                generation_config={"temperature": 0.2},
-                request_options={"timeout": 150, "retry": None},
-            )
-            return r.text
+            if provider == "Claude":
+                return ask_claude(model_name, items, system)
+            return ask_gemini(model_name, items, system)
         except Exception as e:
             msg = str(e)
             if "limit: 0" in msg:
                 raise RuntimeError("النموذج ده مش متاح في الباقة المجانية، اختار نموذج تاني من القايمة.")
-            if "429" in msg:
+            if "credit balance" in msg.lower():
+                raise RuntimeError("رصيد Claude خلص، اشحن الحساب من console.anthropic.com.")
+            if "401" in msg or "authentication" in msg.lower():
+                raise RuntimeError("المفتاح غلط أو منتهي.")
+            if "429" in msg or "rate_limit" in msg.lower() or "overloaded" in msg.lower():
                 m = re.search(r'retry in (\d+(?:\.\d+)?)s', msg)
                 delay = float(m.group(1)) if m else 30
                 time.sleep(min(delay + 2, 75))
@@ -127,14 +175,15 @@ def call_model(model_name, content):
     raise RuntimeError("وصلت لحد الاستخدام، استنى دقيقة وجرّب تاني.")
 
 
-def translate_chunk(model_name, chunk):
+# ---------------------------------------------------------------- الترجمة
+def translate_chunk(provider, model_name, chunk):
     start = time.time()
-    content = [SYSTEM_PROMPT]
+    items = []
     for i, text, png in chunk:
-        content.append(f"===PAGE {i + 1}===")
-        content.append({"mime_type": "image/png", "data": png})
-        content.append(f"النص المستخرج:\n{text}")
-    raw = clean_markdown(call_model(model_name, content))
+        items.append(("text", f"===PAGE {i + 1}==="))
+        items.append(("image", png))
+        items.append(("text", f"النص المستخرج:\n{text}"))
+    raw = clean_markdown(call_model(provider, model_name, items))
 
     parts = re.split(r'===\s*PAGE\s*(\d+)\s*===', raw)
     out = {}
@@ -199,83 +248,261 @@ def build_pdf(src_doc, results):
     return out.tobytes(garbage=3, deflate=True)
 
 
+def translate_tab(provider, model_name):
+    st.write("ارفع ملف الـ PDF، وهتاخد PDF جديد فيه السلايد الأصلي + الترجمة تحته.")
+    uploaded_file = st.file_uploader("اختر ملف PDF", type=["pdf"], key="tr_pdf")
+    if uploaded_file is None or not st.button("ابدأ الترجمة 🚀"):
+        return
+
+    src_doc = fitz.open(stream=uploaded_file.read(), filetype="pdf")
+    pages = []
+    for i in range(len(src_doc)):
+        pg = src_doc.load_page(i)
+        t = pg.get_text()
+        if t.strip() or pg.get_images():
+            png = pg.get_pixmap(dpi=80).tobytes("png")
+            pages.append((i, t, png))
+
+    if not pages:
+        st.error("الملف فاضي.")
+        return
+
+    chunks = [pages[k:k + PAGES_PER_REQUEST]
+              for k in range(0, len(pages), PAGES_PER_REQUEST)]
+
+    results, failed = {}, []
+    progress = st.progress(0.0)
+    status = st.empty()
+    done = 0
+
+    with ThreadPoolExecutor(max_workers=WORKERS) as pool:
+        futures = {pool.submit(translate_chunk, provider, model_name, c): c
+                   for c in chunks}
+        for fut in as_completed(futures):
+            c = futures[fut]
+            nums = f"{c[0][0] + 1}-{c[-1][0] + 1}"
+            try:
+                out, secs = fut.result()
+                results.update(out)
+                status.write(f"✅ سلايدات {nums} خلصت في {secs:.0f} ثانية")
+            except Exception as e:
+                failed.append(nums)
+                st.error(f"سلايدات {nums}: {str(e)[:200]}")
+            done += 1
+            progress.progress(done / len(chunks))
+
+    if not results:
+        st.error("مفيش ولا صفحة اترجمت. جرّب نموذج تاني من القايمة.")
+        return
+
+    status.write("بجهّز ملف الـ PDF...")
+    try:
+        pdf_bytes = build_pdf(src_doc, results)
+    except Exception as e:
+        st.error(f"مشكلة في عمل الـ PDF: {str(e)[:300]}")
+        return
+
+    status.empty()
+    if failed:
+        st.warning(f"اترجمت {len(results)} من {len(pages)} صفحة. اللي فشل: {', '.join(failed)}")
+    else:
+        st.success(f"تمت ترجمة {len(results)} من {len(pages)} صفحة 🎉")
+    st.download_button("📥 تحميل الـ PDF المترجم", pdf_bytes,
+                       "Translated.pdf", "application/pdf")
+
+
+# ---------------------------------------------------------------- الكويز
+QUIZ_JSON_EXAMPLE = (
+    '{"questions":[{"q":"نص السؤال","options":["الخيار 1","الخيار 2","الخيار 3","الخيار 4"],'
+    '"answer":0,"explanation":"شرح قصير للإجابة الصحيحة"}]}'
+)
+
+
+def make_quiz_prompt(n, level, qtype):
+    if qtype == "اختيار من متعدد":
+        kind = "كل الأسئلة اختيار من متعدد، لكل سؤال 4 خيارات."
+    elif qtype == "صح وخطأ":
+        kind = 'كل الأسئلة صح وخطأ، والخياران دائمًا بالضبط: ["صح","خطأ"].'
+    else:
+        kind = ('مزيج: حوالي 70% اختيار من متعدد (4 خيارات) و30% صح وخطأ '
+                '(الخياران بالضبط ["صح","خطأ"]).')
+    return f"""
+أنت أستاذ جامعي متخصص في الكيمياء والأحياء وعلوم الرياضة. ستستلم نص محاضرة، وعليك إنشاء كويز منها.
+القواعد:
+1. عدد الأسئلة بالضبط {n}.
+2. {kind}
+3. مستوى الصعوبة: {level}.
+4. اكتب الأسئلة والخيارات والشرح بالعربية، مع كتابة المصطلحات العلمية بالإنجليزية بين قوسين.
+5. اترك المعادلات والرموز والوحدات بالإنجليزية بصيغة Unicode مثل H₂O و CO₂ و k₀.
+6. كل سؤال له إجابة صحيحة واحدة فقط، والخيارات الخاطئة تكون مقنعة وليست سخيفة.
+7. الأسئلة من محتوى المحاضرة فقط، وتغطي أجزاءها المختلفة وليس أول صفحة فقط. ركّز على الفهم وليس الحفظ الحرفي.
+8. الشرح جملة أو جملتان فقط، ويوضح لماذا الإجابة صحيحة.
+9. لا تستخدم Markdown نهائيًا.
+10. "answer" هو رقم الخيار الصحيح بدءًا من 0.
+11. أخرج JSON صالح فقط بدون أي كلام قبله أو بعده وبدون علامات ```، بهذا الشكل:
+{QUIZ_JSON_EXAMPLE}
+"""
+
+
+def parse_quiz(raw):
+    raw = raw.strip()
+    raw = re.sub(r'^```(?:json)?', '', raw).strip()
+    raw = re.sub(r'```$', '', raw).strip()
+    a, b = raw.find('{'), raw.rfind('}')
+    if a == -1 or b == -1:
+        raise ValueError("الرد مش JSON")
+    data = json.loads(raw[a:b + 1])
+    quiz = []
+    for item in data.get("questions", []):
+        q = str(item.get("q", "")).strip()
+        opts = [str(o).strip() for o in item.get("options", [])]
+        ans = item.get("answer")
+        if not q or len(opts) < 2 or not isinstance(ans, int) or not (0 <= ans < len(opts)):
+            continue
+        correct = opts[ans]
+        if set(opts) != {"صح", "خطأ"}:
+            random.shuffle(opts)       # نغيّر ترتيب الخيارات عشان الإجابة متبقاش دايمًا في نفس المكان
+        else:
+            opts = ["صح", "خطأ"]
+        quiz.append({
+            "q": q,
+            "options": opts,
+            "answer": opts.index(correct),
+            "explanation": str(item.get("explanation", "")).strip(),
+        })
+    if not quiz:
+        raise ValueError("معرفتش أطلّع أسئلة من الرد")
+    return quiz
+
+
+QUIZ_CSS = """
+<style>
+[class*="st-key-quizq"] { direction: rtl; text-align: right; }
+.qbox { direction: rtl; text-align: right; font-size: 1.05rem;
+        font-weight: 600; margin: 18px 0 4px 0; }
+.rbox { direction: rtl; text-align: right; padding: 10px 14px;
+        border-radius: 10px; margin: 4px 0 10px 0; line-height: 1.7; }
+.ok  { background: rgba(46,160,67,.18); }
+.bad { background: rgba(218,54,51,.18); }
+.skip{ background: rgba(150,150,150,.18); }
+</style>
+"""
+
+
+def quiz_tab(provider, model_name):
+    st.markdown(QUIZ_CSS, unsafe_allow_html=True)
+    st.write("ارفع المحاضرة وهتطلعلك أسئلة تجاوب عليها وتشوف درجتك.")
+
+    uploaded = st.file_uploader("اختر ملف PDF للكويز", type=["pdf"], key="quiz_pdf")
+    c1, c2 = st.columns(2)
+    n = c1.slider("عدد الأسئلة", 5, 20, 10)
+    level = c2.selectbox("المستوى", ["سهل", "متوسط", "صعب"], index=1)
+    qtype = st.radio("نوع الأسئلة", ["اختيار من متعدد", "صح وخطأ", "مختلط"],
+                     horizontal=True, key="qtype")
+
+    if uploaded is not None and st.button("ولّد الكويز 🧠"):
+        doc = fitz.open(stream=uploaded.read(), filetype="pdf")
+        parts = []
+        for i in range(len(doc)):
+            t = doc.load_page(i).get_text().strip()
+            if t:
+                parts.append(f"--- سلايد {i + 1} ---\n{t}")
+        text = "\n\n".join(parts)
+        if not text.strip():
+            st.error("الملف مفيهوش نص (ممكن يكون صور ممسوحة).")
+            return
+        if len(text) > MAX_QUIZ_CHARS:
+            text = text[:MAX_QUIZ_CHARS]
+            st.info("الملف طويل، فالكويز مبني على أول جزء منه.")
+        with st.spinner("بجهّز الأسئلة..."):
+            try:
+                raw = call_model(provider, model_name, [("text", text)],
+                                 system=make_quiz_prompt(n, level, qtype))
+                st.session_state.quiz = parse_quiz(raw)
+                st.session_state.submitted = False
+                st.session_state.attempt = st.session_state.get("attempt", 0) + 1
+            except Exception as e:
+                st.error(f"معرفتش أجهّز الكويز: {str(e)[:200]}. جرّب تاني أو غيّر النموذج.")
+                return
+
+    quiz = st.session_state.get("quiz")
+    if not quiz:
+        return
+
+    attempt = st.session_state.get("attempt", 1)
+    submitted = st.session_state.get("submitted", False)
+    st.divider()
+
+    answers = []
+    for i, item in enumerate(quiz):
+        st.markdown(f'<div class="qbox">{i + 1}. {html.escape(item["q"])}</div>',
+                    unsafe_allow_html=True)
+        choice = st.radio(
+            f"سؤال {i + 1}", item["options"], index=None,
+            key=f"quizq_{attempt}_{i}", disabled=submitted,
+            label_visibility="collapsed",
+        )
+        answers.append(choice)
+
+        if submitted:
+            correct = item["options"][item["answer"]]
+            if choice is None:
+                css, icon, head = "skip", "⏭️", "لم تجب"
+            elif choice == correct:
+                css, icon, head = "ok", "✅", "إجابة صحيحة"
+            else:
+                css, icon, head = "bad", "❌", f"إجابتك: {html.escape(choice)}"
+            body = f"{icon} {head}"
+            if choice != correct:
+                body += f"<br>الإجابة الصحيحة: <b>{html.escape(correct)}</b>"
+            if item["explanation"]:
+                body += f"<br>{html.escape(item['explanation'])}"
+            st.markdown(f'<div class="rbox {css}">{body}</div>', unsafe_allow_html=True)
+
+    if not submitted:
+        if st.button("صحّح الإجابات ✅"):
+            st.session_state.submitted = True
+            st.rerun()
+    else:
+        score = sum(1 for it, a in zip(quiz, answers)
+                    if a is not None and it["options"].index(a) == it["answer"])
+        pct = round(score / len(quiz) * 100)
+        emoji = "🏆" if pct >= 85 else ("👍" if pct >= 60 else "📚")
+        st.success(f"{emoji} درجتك: {score} من {len(quiz)} ({pct}%)")
+        b1, b2 = st.columns(2)
+        if b1.button("🔁 أعد المحاولة"):
+            st.session_state.submitted = False
+            st.session_state.attempt = attempt + 1
+            st.rerun()
+        if b2.button("🗑️ كويز جديد"):
+            st.session_state.pop("quiz", None)
+            st.session_state.submitted = False
+            st.rerun()
+
+
+# ---------------------------------------------------------------- التشغيل
 if api_key:
-    genai.configure(api_key=api_key)
+    if provider == "Gemini":
+        genai.configure(api_key=api_key)
 
     if not ensure_font():
         st.error("معرفتش أنزّل الخط العربي. اتأكد إن التطبيق عنده إنترنت وجرّب تعمل Reboot.")
         st.stop()
 
     try:
-        models = get_models(api_key)
+        models = get_models(provider, api_key)
     except Exception as e:
         st.error(f"مشكلة في المفتاح أو الاتصال: {str(e)[:200]}")
         st.stop()
 
     if not models:
-        st.error("مفيش نماذج Gemini متاحة لمفتاحك.")
+        st.error("مفيش نماذج متاحة لمفتاحك.")
         st.stop()
 
     model_name = st.selectbox("اختر النموذج:", models, index=0)
-    uploaded_file = st.file_uploader("اختر ملف PDF", type=["pdf"])
 
-    if uploaded_file is not None:
-        if st.button("ابدأ الترجمة 🚀"):
-            src_doc = fitz.open(stream=uploaded_file.read(), filetype="pdf")
-            pages = []
-            for i in range(len(src_doc)):
-                pg = src_doc.load_page(i)
-                t = pg.get_text()
-                if t.strip() or pg.get_images():
-                    png = pg.get_pixmap(dpi=80).tobytes("png")
-                    pages.append((i, t, png))
-
-            if not pages:
-                st.error("الملف فاضي.")
-                st.stop()
-
-            chunks = [pages[k:k + PAGES_PER_REQUEST]
-                      for k in range(0, len(pages), PAGES_PER_REQUEST)]
-
-            results, failed = {}, []
-            progress = st.progress(0.0)
-            status = st.empty()
-            done = 0
-
-            with ThreadPoolExecutor(max_workers=WORKERS) as pool:
-                futures = {pool.submit(translate_chunk, model_name, c): c for c in chunks}
-                for fut in as_completed(futures):
-                    c = futures[fut]
-                    nums = f"{c[0][0] + 1}-{c[-1][0] + 1}"
-                    try:
-                        out, secs = fut.result()
-                        results.update(out)
-                        status.write(f"✅ سلايدات {nums} خلصت في {secs:.0f} ثانية")
-                    except Exception as e:
-                        failed.append(nums)
-                        st.error(f"سلايدات {nums}: {str(e)[:200]}")
-                    done += 1
-                    progress.progress(done / len(chunks))
-
-            if not results:
-                st.error("مفيش ولا صفحة اترجمت. جرّب نموذج تاني من القايمة.")
-                st.stop()
-
-            status.write("بجهّز ملف الـ PDF...")
-            try:
-                pdf_bytes = build_pdf(src_doc, results)
-            except Exception as e:
-                st.error(f"مشكلة في عمل الـ PDF: {str(e)[:300]}")
-                st.stop()
-
-            status.empty()
-            if failed:
-                st.warning(f"اترجمت {len(results)} من {len(pages)} صفحة. اللي فشل: {', '.join(failed)}")
-            else:
-                st.success(f"تمت ترجمة {len(results)} من {len(pages)} صفحة 🎉")
-            st.download_button(
-                "📥 تحميل الـ PDF المترجم",
-                pdf_bytes,
-                "Translated.pdf",
-                "application/pdf",
-)
+    tab1, tab2 = st.tabs(["🌐 الترجمة", "🧠 كويز تفاعلي"])
+    with tab1:
+        translate_tab(provider, model_name)
+    with tab2:
+        quiz_tab(provider, model_name)
