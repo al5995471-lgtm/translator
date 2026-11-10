@@ -12,7 +12,13 @@ st.set_page_config(page_title="المترجم العلمي للمحاضرات", 
 st.title("🔬 مترجم المحاضرات العلمي (كيمياء، بايو، رياضة)")
 st.write("ارفع ملف الـ PDF، وهتاخد PDF جديد فيه السلايد الأصلي + الترجمة تحته.")
 
-api_key = st.text_input("أدخل مفتاح Gemini API بتاعك:", type="password")
+# المفتاح من Secrets، ولو مش موجود يطلبه يدويًا
+try:
+    api_key = st.secrets.get("GEMINI_API_KEY", "")
+except Exception:
+    api_key = ""
+if not api_key:
+    api_key = st.text_input("أدخل مفتاح Gemini API بتاعك:", type="password")
 
 PAGES_PER_REQUEST = 2
 WORKERS = 2
@@ -220,7 +226,6 @@ if api_key:
             for i in range(len(src_doc)):
                 pg = src_doc.load_page(i)
                 t = pg.get_text()
-                # صفحة فيها نص أو صور
                 if t.strip() or pg.get_images():
                     png = pg.get_pixmap(dpi=80).tobytes("png")
                     pages.append((i, t, png))
