@@ -2,6 +2,7 @@ import streamlit as st
 import fitz  # PyMuPDF
 import google.generativeai as genai
 import anthropic
+import ast
 import base64
 import json
 import random
@@ -11,12 +12,20 @@ import os
 import re
 import time
 import requests
+import numpy as np
+import pandas as pd
+
+try:
+    import altair as alt
+except Exception:
+    alt = None
 
 st.set_page_config(page_title="المترجم العلمي للمحاضرات", page_icon="🔬")
 st.title("🔬 أدوات المحاضرات العلمية")
 
-provider = st.radio("اختر المزوّد:", ["Claude", "Gemini"], horizontal=True)
-KEY_NAME = "ANTHROPIC_API_KEY" if provider == "Claude" else "GEMINI_API_KEY"
+provider = st.radio("اختر المزوّد:", ["Gemini", "Claude"], horizontal=True)
+KEY_NAMES = {"Gemini": "GEMINI_API_KEY", "Claude": "ANTHROPIC_API_KEY"}
+KEY_NAME = KEY_NAMES[provider]
 
 try:
     api_key = st.secrets.get(KEY_NAME, "")
@@ -27,7 +36,7 @@ if not api_key:
 
 PAGES_PER_REQUEST = 2
 WORKERS = 2
-MAX_QUIZ_CHARS = 40000
+MAX_CHARS = 40000
 FONT_DIR = "fonts"
 FONT_FILE = "Amiri-Regular.ttf"
 FONT_URLS = [
@@ -35,6 +44,7 @@ FONT_URLS = [
     "https://raw.githubusercontent.com/google/fonts/main/ofl/amiri/Amiri-Regular.ttf",
 ]
 CLAUDE_FALLBACK = ["claude-sonnet-5-5", "claude-haiku-5-5", "claude-opus-5-5"]
+SRC_TYPES = ["pdf", "png", "jpg", "jpeg"]
 
 SYSTEM_PROMPT = """
 أنت مترجم أكاديمي متخصص في الكيمياء والأحياء وعلوم الرياضة.
@@ -54,6 +64,32 @@ SYSTEM_PROMPT = """
 9. كل سلايد يبدأ بسطر على شكل ===PAGE رقم=== . اكتب نفس هذا السطر بالضبط قبل ترجمة كل سلايد.
 """
 
+OCR_PROMPT = """
+You are an expert OCR reader for chemistry and science study material.
+You receive photos or scans of lecture slides or exam papers (they may be rotated, skewed or taken at an angle).
+Rules:
+1. Transcribe ALL printed and handwritten text exactly as written, keeping the original language, numbering and question order.
+2. Write formulas with Unicode (H₂O, CO₂, k₀).
+3. For every chemical structure, Newman/Fischer projection, graph, diagram or table, add a short description in square brackets at the place where it appears,
+   for example [Compound A: Newman projection with OH, F, H on the front carbon].
+4. Each image starts with a line like ===IMAGE n===. Keep these separator lines.
+5. Output only the transcription, no comments.
+"""
+
+SOLVE_PROMPT = """
+You are a university professor of organic chemistry and stereochemistry.
+You receive photos or scans of an exam paper (they may be rotated, skewed, or include structures, Newman or Fischer projections, tables).
+Instructions:
+1. Read every question carefully. For structure questions, analyze the drawing step by step
+   (for example CIP priorities for R/S and E/Z) before you answer.
+2. For each question give: the question number, the answer, and a one or two sentence reason.
+3. If a question or a drawing is unreadable or ambiguous, say so clearly instead of guessing.
+4. Write the reasons in {expl_lang}. Keep technical terms and the answer letters/words as in the exam.
+5. No Markdown. Use exactly this format for every question, one block per question:
+Q1) Answer: ... | Reason: ...
+6. Output only the answers, no introduction.
+"""
+
 ARABIC = re.compile(r'[\u0600-\u06FF]')
 EQUATION = re.compile(r'[→⇌=+<>]')
 BAD_WORDS = ["robotics", "tts", "image", "live", "embedding", "audio", "computer",
@@ -66,6 +102,10 @@ def clean_markdown(text):
     text = re.sub(r'\*+(.*?)\*+', r'\1', text)
     text = re.sub(r'#+\s*', '', text)
     return text.strip()
+
+
+def esc(text):
+    return html.escape(str(text)).replace("\n", "<br>")
 
 
 @st.cache_resource(show_spinner="بنزّل الخط العربي...")
@@ -117,7 +157,8 @@ def get_models(provider, key):
     return sorted(names, key=lambda n: (rank(n), n))
 
 
-def ask_gemini(model_name, items, system):
+def ask_gemini(model_name, items, system, key):
+    genai.configure(api_key=key)
     model = genai.GenerativeModel(model_name)
     content = [system]
     for kind, data in items:
@@ -130,8 +171,8 @@ def ask_gemini(model_name, items, system):
     return r.text
 
 
-def ask_claude(model_name, items, system):
-    client = anthropic.Anthropic(api_key=api_key, max_retries=0, timeout=150)
+def ask_claude(model_name, items, system, key):
+    client = anthropic.Anthropic(api_key=key, max_retries=0, timeout=150)
     content = []
     for kind, data in items:
         if kind == "image":
@@ -150,29 +191,118 @@ def ask_claude(model_name, items, system):
     return "".join(b.text for b in r.content if b.type == "text")
 
 
-def call_model(provider, model_name, items, system=SYSTEM_PROMPT):
+def parse_delay(msg):
+    m = re.search(r'(?:retry|try again) in\s+((?:\d+h)?(?:\d+m)?(?:\d+(?:\.\d+)?s)?)', msg)
+    if not m or not m.group(1):
+        return None
+    g = m.group(1)
+    total = 0.0
+    for pat, mult in ((r'(\d+)h', 3600), (r'(\d+)m', 60), (r'(\d+(?:\.\d+)?)s', 1)):
+        x = re.search(pat, g)
+        if x:
+            total += float(x.group(1)) * mult
+    return total
+
+
+def call_model(provider, model_name, items, system=SYSTEM_PROMPT, key=None):
+    key = key or api_key
     for attempt in range(5):
         try:
             if provider == "Claude":
-                return ask_claude(model_name, items, system)
-            return ask_gemini(model_name, items, system)
+                return ask_claude(model_name, items, system, key)
+            return ask_gemini(model_name, items, system, key)
         except Exception as e:
             msg = str(e)
+            low = msg.lower()
             if "limit: 0" in msg:
                 raise RuntimeError("النموذج ده مش متاح في الباقة المجانية، اختار نموذج تاني من القايمة.")
-            if "credit balance" in msg.lower():
+            if "credit balance" in low:
                 raise RuntimeError("رصيد Claude خلص، اشحن الحساب من console.anthropic.com.")
-            if "401" in msg or "authentication" in msg.lower():
+            if "401" in msg or "authentication" in low or "invalid api key" in low:
                 raise RuntimeError("المفتاح غلط أو منتهي.")
-            if "429" in msg or "rate_limit" in msg.lower() or "overloaded" in msg.lower():
-                m = re.search(r'retry in (\d+(?:\.\d+)?)s', msg)
-                delay = float(m.group(1)) if m else 30
-                time.sleep(min(delay + 2, 75))
+            if "429" in msg or "rate_limit" in low or "rate limit" in low or "overloaded" in low:
+                delay = parse_delay(msg)
+                if delay is not None and delay > 90:
+                    raise RuntimeError(
+                        f"وصلت للحد اليومي لهذا النموذج. جرّب نموذج تاني أو ارجع بعد {delay / 3600:.1f} ساعة تقريبًا.")
+                time.sleep(min((delay or 30) + 2, 90))
                 continue
             if attempt == 4:
                 raise RuntimeError(msg[:200])
             time.sleep(3)
     raise RuntimeError("وصلت لحد الاستخدام، استنى دقيقة وجرّب تاني.")
+
+
+def detect_lang(text):
+    """يحدد لغة المصدر: عربي أو إنجليزي (أو غيره)"""
+    sample = text[:6000]
+    ar = len(re.findall(r'[\u0600-\u06FF]', sample))
+    lat = len(re.findall(r'[A-Za-z]', sample))
+    if ar > lat:
+        return "Arabic", True
+    return "the same language as the text (for example English)", False
+
+
+def parse_json_block(raw):
+    raw = raw.strip()
+    raw = re.sub(r'^```(?:json)?', '', raw).strip()
+    raw = re.sub(r'```$', '', raw).strip()
+    a, b = raw.find('{'), raw.rfind('}')
+    if a == -1 or b == -1:
+        raise ValueError("الرد مش JSON")
+    return json.loads(raw[a:b + 1])
+
+
+# ---------------------------------------------------------------- قراءة الصور
+def page_png(pg, max_side=1600):
+    r = pg.rect
+    z = max_side / max(r.width, r.height)
+    return pg.get_pixmap(matrix=fitz.Matrix(z, z)).tobytes("png")
+
+
+def file_to_pngs(f, max_side=1600):
+    """أي ملف (PDF أو صورة) -> قايمة صور PNG"""
+    name = f.name.lower()
+    if name.endswith(".pdf"):
+        doc = fitz.open(stream=f.getvalue(), filetype="pdf")
+        return [page_png(pg, max_side) for pg in doc]
+    ext = name.rsplit(".", 1)[-1]
+    ext = "jpeg" if ext == "jpg" else ext
+    doc = fitz.open(stream=f.getvalue(), filetype=ext)
+    return [page_png(doc[0], max_side)]
+
+
+def ocr_images(pngs, provider, model_name, key):
+    out = []
+    for s in range(0, len(pngs), 3):
+        batch = pngs[s:s + 3]
+        items = []
+        for j, p in enumerate(batch):
+            items.append(("text", f"===IMAGE {s + j + 1}==="))
+            items.append(("image", p))
+        out.append(call_model(provider, model_name, items, system=OCR_PROMPT, key=key))
+    return "\n\n".join(out)
+
+
+def read_sources(files, provider, model_name, key):
+    """نص من ملفات PDF (فيها نص) + صور + PDF ممسوح"""
+    texts, scans = [], []
+    for f in files:
+        name = f.name.lower()
+        if name.endswith(".pdf"):
+            doc = fitz.open(stream=f.getvalue(), filetype="pdf")
+            for i, pg in enumerate(doc):
+                t = pg.get_text().strip()
+                if len(t) >= 40:
+                    texts.append(f"--- {f.name} / page {i + 1} ---\n{t}")
+                else:
+                    scans.append(page_png(pg))
+        else:
+            scans.append(file_to_pngs(f)[0])
+    if scans:
+        with st.spinner(f"بقرأ {len(scans)} صورة/صفحة..."):
+            texts.append(ocr_images(scans, provider, model_name, key))
+    return "\n\n".join(texts)
 
 
 # ---------------------------------------------------------------- الترجمة
@@ -350,24 +480,8 @@ Rules:
 """
 
 
-def detect_lang(text):
-    """يحدد لغة المحاضرة: عربي أو إنجليزي (أو غيره)"""
-    sample = text[:6000]
-    ar = len(re.findall(r'[\u0600-\u06FF]', sample))
-    lat = len(re.findall(r'[A-Za-z]', sample))
-    if ar > lat:
-        return "Arabic", True
-    return "the same language as the text (for example English)", False
-
-
 def parse_quiz(raw):
-    raw = raw.strip()
-    raw = re.sub(r'^```(?:json)?', '', raw).strip()
-    raw = re.sub(r'```$', '', raw).strip()
-    a, b = raw.find('{'), raw.rfind('}')
-    if a == -1 or b == -1:
-        raise ValueError("الرد مش JSON")
-    data = json.loads(raw[a:b + 1])
+    data = parse_json_block(raw)
     quiz = []
     for item in data.get("questions", []):
         q = str(item.get("q", "")).strip()
@@ -407,9 +521,10 @@ def quiz_css(rtl):
 
 
 def quiz_tab(provider, model_name):
-    st.write("ارفع المحاضرة وهتطلعلك أسئلة بنفس لغة السلايد، تجاوب عليها وتشوف درجتك.")
+    st.write("ارفع المحاضرة (PDF أو صور) وهتطلعلك أسئلة بنفس لغة السلايد، تجاوب عليها وتشوف درجتك.")
 
-    uploaded = st.file_uploader("اختر ملف PDF للكويز", type=["pdf"], key="quiz_pdf")
+    uploaded = st.file_uploader("اختر ملفات PDF أو صور للكويز", type=SRC_TYPES,
+                                accept_multiple_files=True, key="quiz_pdf")
     c1, c2 = st.columns(2)
     n = c1.slider("عدد الأسئلة", 5, 20, 10)
     level = c2.selectbox("المستوى", ["سهل", "متوسط", "صعب"], index=1)
@@ -417,19 +532,17 @@ def quiz_tab(provider, model_name):
     qtype = st.radio("نوع الأسئلة", ["اختيار من متعدد", "صح وخطأ", "مختلط"],
                      horizontal=True, key="qtype")
 
-    if uploaded is not None and st.button("ولّد الكويز 🧠"):
-        doc = fitz.open(stream=uploaded.read(), filetype="pdf")
-        parts = []
-        for i in range(len(doc)):
-            t = doc.load_page(i).get_text().strip()
-            if t:
-                parts.append(f"--- Slide {i + 1} ---\n{t}")
-        text = "\n\n".join(parts)
-        if not text.strip():
-            st.error("الملف مفيهوش نص (ممكن يكون صور ممسوحة).")
+    if uploaded and st.button("ولّد الكويز 🧠"):
+        try:
+            text = read_sources(uploaded, provider, model_name, api_key)
+        except Exception as e:
+            st.error(str(e)[:250])
             return
-        if len(text) > MAX_QUIZ_CHARS:
-            text = text[:MAX_QUIZ_CHARS]
+        if not text.strip():
+            st.error("معرفتش أقرأ أي نص من الملفات.")
+            return
+        if len(text) > MAX_CHARS:
+            text = text[:MAX_CHARS]
             st.info("الملف طويل، فالكويز مبني على أول جزء منه.")
 
         lang_name, rtl = detect_lang(text)
@@ -442,7 +555,7 @@ def quiz_tab(provider, model_name):
                 st.session_state.submitted = False
                 st.session_state.attempt = st.session_state.get("attempt", 0) + 1
             except Exception as e:
-                st.error(f"معرفتش أجهّز الكويز: {str(e)[:200]}. جرّب تاني أو غيّر النموذج.")
+                st.error(f"معرفتش أجهّز الكويز: {str(e)[:250]}. جرّب تاني أو غيّر النموذج.")
                 return
 
     quiz = st.session_state.get("quiz")
@@ -504,6 +617,381 @@ def quiz_tab(provider, model_name):
             st.rerun()
 
 
+# ---------------------------------------------------------------- حل ورقة من صورة
+def solve_tab(provider, model_name):
+    st.write("صوّر ورقة امتحان (أو ارفع PDF ممسوح)، والأداة هتقرأ الأسئلة وتحلها بسبب مختصر. "
+             "مناسبة للأسئلة المرسومة (R/S، E/Z، Newman، Fischer...).")
+    files = st.file_uploader("ورقة الامتحان (صور أو PDF)", type=SRC_TYPES,
+                             accept_multiple_files=True, key="solve_files")
+    expl = st.radio("لغة الشرح", ["العربية", "English"], horizontal=True, key="solve_lang")
+
+    if files and st.button("اقرأ وحُل 📸"):
+        pngs = []
+        for f in files:
+            pngs.extend(file_to_pngs(f, max_side=1800))
+        if len(pngs) > 8:
+            pngs = pngs[:8]
+            st.info("الصور كتير، فهحل أول 8 صفحات بس.")
+
+        items = []
+        for j, p in enumerate(pngs):
+            items.append(("text", f"===IMAGE {j + 1}==="))
+            items.append(("image", p))
+        prompt = SOLVE_PROMPT.format(expl_lang="Arabic" if expl == "العربية" else "English")
+        with st.spinner("بقرأ الورقة وبحل..."):
+            try:
+                st.session_state.solved = (
+                    call_model(provider, model_name, items, system=prompt),
+                    expl == "العربية")
+            except Exception as e:
+                st.error(f"معرفتش أكمل: {str(e)[:250]}")
+                return
+
+    solved = st.session_state.get("solved")
+    if solved:
+        text, rtl = solved
+        d = "rtl" if rtl else "ltr"
+        a = "right" if rtl else "left"
+        st.divider()
+        st.warning("راجع الإجابات بنفسك، خصوصًا أسئلة الرسم (R/S وE/Z)، لأن النموذج ممكن يغلط في قراءة الرسومات.")
+        for block in re.split(r'\n\s*\n|\n(?=Q\d+\))', text.strip()):
+            if block.strip():
+                st.markdown(f'<div style="direction:{d};text-align:{a};line-height:1.8;'
+                            f'margin:6px 0">{esc(block.strip())}</div>', unsafe_allow_html=True)
+        st.download_button("📥 تحميل الإجابات (txt)", text, "answers.txt", "text/plain")
+
+
+# ---------------------------------------------------------------- محاكي المعادلات
+SAFE_FUNCS = {
+    "exp": np.exp, "ln": np.log, "log": np.log, "log10": np.log10, "log2": np.log2,
+    "sqrt": np.sqrt, "sin": np.sin, "cos": np.cos, "tan": np.tan,
+    "sinh": np.sinh, "cosh": np.cosh, "tanh": np.tanh, "abs": np.abs,
+}
+
+SIM_PROMPT = """
+You are a professor of chemistry, biology, sports science and physics who builds interactive teaching simulations.
+You receive lecture material (text) and/or a topic or equation typed by the student.
+Create @N@ simulation(s) of the most important quantitative relationship(s) (equations or formulas) in the material.
+@FOCUS@
+
+Each simulation is a JSON object with exactly these fields:
+{
+ "title": "short title",
+ "description": "2-3 sentences: what the relationship means and what to try with the sliders",
+ "formula": "the formula as plain text using Unicode, for example k = A·e^(−Ea/RT)",
+ "variables": [{"name":"T","label":"Temperature","unit":"K","min":250,"max":500,"default":300,"step":1}],
+ "x": "T",
+ "x_label": "Temperature (K)",
+ "y_label": "Rate constant k",
+ "log_y": false,
+ "constants": {"R": 8.314, "A": 1000000000},
+ "curves": [{"label":"Without catalyst","expr":"A*exp(-Ea*1000/(R*T))"}],
+ "readouts": [{"label":"k at the chosen T","expr":"A*exp(-Ea*1000/(R*T))"}],
+ "observe": ["what the student should notice", "another observation"]
+}
+
+Rules for expressions ("expr"):
+1. One Python-style math expression. Operators: + - * / ** (or ^) and parentheses.
+   Functions allowed: exp, ln, log (natural log), log10, log2, sqrt, sin, cos, tan, sinh, cosh, tanh, abs.
+   The constants pi and e are available.
+2. Use ONLY names declared in "variables" or "constants". Names: letters, digits, underscore, starting with a letter, no spaces,
+   and not equal to a function name or to "e" or "pi".
+3. "x" must be the name of one variable. The curve is plotted against it while the other variables are controlled by sliders.
+4. Use realistic ranges and units, and convert units inside the expression (for example kJ to J with *1000).
+5. To compare cases (for example with and without a catalyst, trained vs untrained) use 2 or 3 curves with different labels
+   and add extra variables for the differences.
+6. At most 5 variables, 3 curves, 4 readouts.
+7. Do not invent formulas. Use the one in the material or the standard textbook formula.
+   If the material has no quantitative relationship, return {"simulations": []}.
+
+LANGUAGE: write title, description, labels, "observe" and the words in "formula" in @LANG@. Keep symbols and units standard.
+No Markdown. Output valid JSON only (no text before or after, no ``` fences) in this shape: {"simulations":[ ... ]}
+"""
+
+
+def safe_eval(expr, env):
+    """تقييم آمن لمعادلة رياضية (بدون eval)"""
+    expr = str(expr).strip().replace("^", "**").replace("×", "*").replace("·", "*").replace("−", "-")
+    if not expr or len(expr) > 300:
+        raise ValueError("bad expression")
+    tree = ast.parse(expr, mode="eval")
+
+    def ev(node):
+        if isinstance(node, ast.Expression):
+            return ev(node.body)
+        if isinstance(node, ast.Constant):
+            if isinstance(node.value, (int, float)) and not isinstance(node.value, bool):
+                return np.float64(node.value)
+            raise ValueError("constant not allowed")
+        if isinstance(node, ast.Name):
+            if node.id in env:
+                return env[node.id]
+            raise ValueError(f"unknown name {node.id}")
+        if isinstance(node, ast.UnaryOp):
+            v = ev(node.operand)
+            if isinstance(node.op, ast.USub):
+                return -v
+            if isinstance(node.op, ast.UAdd):
+                return v
+            raise ValueError("operator not allowed")
+        if isinstance(node, ast.BinOp):
+            a, b = ev(node.left), ev(node.right)
+            if isinstance(node.op, ast.Add):
+                return a + b
+            if isinstance(node.op, ast.Sub):
+                return a - b
+            if isinstance(node.op, ast.Mult):
+                return a * b
+            if isinstance(node.op, ast.Div):
+                return a / b
+            if isinstance(node.op, ast.Pow):
+                return np.power(a, b)
+            raise ValueError("operator not allowed")
+        if isinstance(node, ast.Call):
+            if (isinstance(node.func, ast.Name) and node.func.id in SAFE_FUNCS
+                    and not node.keywords and 1 <= len(node.args) <= 2):
+                return SAFE_FUNCS[node.func.id](*[ev(x) for x in node.args])
+            raise ValueError("function not allowed")
+        raise ValueError("expression not allowed")
+
+    with np.errstate(all="ignore"):
+        return ev(tree)
+
+
+def _f(v, default=None):
+    try:
+        x = float(v)
+        return x if np.isfinite(x) else default
+    except Exception:
+        return default
+
+
+def clean_sim(spec):
+    """يتحقق من المحاكي اللي النموذج طلّعه ويشيل أي حاجة بايظة"""
+    if not isinstance(spec, dict):
+        return None
+    name_ok = re.compile(r'[A-Za-z_][A-Za-z0-9_]*')
+
+    variables, seen = [], set()
+    for v in (spec.get("variables") or [])[:5]:
+        if not isinstance(v, dict):
+            continue
+        name = str(v.get("name", "")).strip()
+        if (not name_ok.fullmatch(name) or name in SAFE_FUNCS or name in ("e", "pi")
+                or name in seen):
+            continue
+        lo, hi = _f(v.get("min")), _f(v.get("max"))
+        if lo is None or hi is None or not lo < hi:
+            continue
+        de = _f(v.get("default"), (lo + hi) / 2)
+        de = min(max(de, lo), hi)
+        step = _f(v.get("step"), (hi - lo) / 100)
+        if not step or step <= 0 or step > (hi - lo):
+            step = (hi - lo) / 100
+        seen.add(name)
+        variables.append({
+            "name": name, "label": str(v.get("label") or name),
+            "unit": str(v.get("unit") or ""), "min": lo, "max": hi,
+            "default": de, "step": step,
+        })
+    if not variables:
+        return None
+
+    constants = {}
+    for k, v in (spec.get("constants") or {}).items():
+        val = _f(v)
+        if name_ok.fullmatch(str(k)) and val is not None and str(k) not in seen \
+                and str(k) not in SAFE_FUNCS and str(k) not in ("e", "pi"):
+            constants[str(k)] = np.float64(val)
+
+    xname = str(spec.get("x", ""))
+    if xname not in seen:
+        xname = variables[0]["name"]
+
+    test_env = {**constants, "pi": np.pi, "e": np.e}
+    for v in variables:
+        test_env[v["name"]] = np.float64(v["default"])
+    xv = next(v for v in variables if v["name"] == xname)
+    arr_env = {**test_env, xname: np.linspace(xv["min"], xv["max"], 20)}
+
+    curves = []
+    for c in (spec.get("curves") or [])[:3]:
+        try:
+            y = np.asarray(safe_eval(c.get("expr", ""), arr_env), dtype=float)
+            if np.isfinite(y).any():
+                curves.append({"label": str(c.get("label") or "y"), "expr": str(c["expr"])})
+        except Exception:
+            continue
+    if not curves:
+        return None
+
+    readouts = []
+    for r in (spec.get("readouts") or [])[:4]:
+        try:
+            safe_eval(r.get("expr", ""), test_env)
+            readouts.append({"label": str(r.get("label") or ""), "expr": str(r["expr"])})
+        except Exception:
+            continue
+
+    return {
+        "title": str(spec.get("title") or "Simulation"),
+        "description": str(spec.get("description") or ""),
+        "formula": str(spec.get("formula") or ""),
+        "variables": variables, "x": xname,
+        "x_label": str(spec.get("x_label") or xv["label"]),
+        "y_label": str(spec.get("y_label") or ""),
+        "log_y": bool(spec.get("log_y")),
+        "constants": constants, "curves": curves, "readouts": readouts,
+        "observe": [str(o) for o in (spec.get("observe") or [])][:5],
+    }
+
+
+def show_chart(chart):
+    for kwargs in ({"width": "stretch"}, {"use_container_width": True}, {}):
+        try:
+            st.altair_chart(chart, **kwargs)
+            return
+        except TypeError:
+            continue
+
+
+def render_sim(sim, idx, gen, rtl):
+    d = "rtl" if rtl else "ltr"
+    a = "right" if rtl else "left"
+    if sim["description"]:
+        st.markdown(f'<div style="direction:{d};text-align:{a};line-height:1.8">'
+                    f'{esc(sim["description"])}</div>', unsafe_allow_html=True)
+    if sim["formula"]:
+        st.code(sim["formula"], language=None)
+
+    vals = {}
+    for v in sim["variables"]:
+        label = f'{v["label"]} ({v["unit"]})' if v["unit"] else v["label"]
+        vals[v["name"]] = st.slider(
+            label, min_value=v["min"], max_value=v["max"], value=v["default"],
+            step=v["step"], key=f"sim{gen}_{idx}_{v['name']}")
+
+    xv = next(v for v in sim["variables"] if v["name"] == sim["x"])
+    base = {**sim["constants"], "pi": np.pi, "e": np.e}
+    base.update({k: np.float64(val) for k, val in vals.items()})
+    xs = np.linspace(xv["min"], xv["max"], 300)
+
+    rows, pts = [], []
+    for c in sim["curves"]:
+        try:
+            ys = np.broadcast_to(np.asarray(safe_eval(c["expr"], {**base, sim["x"]: xs}),
+                                            dtype=float), xs.shape)
+            for x_, y_ in zip(xs, ys):
+                if np.isfinite(y_) and (not sim["log_y"] or y_ > 0):
+                    rows.append({"x": float(x_), "y": float(y_), "curve": c["label"]})
+            yp = float(np.asarray(safe_eval(c["expr"], base)).reshape(-1)[0])
+            if np.isfinite(yp) and (not sim["log_y"] or yp > 0):
+                pts.append({"x": float(vals[sim["x"]]), "y": yp, "curve": c["label"]})
+        except Exception:
+            st.caption(f"⚠️ معرفتش أرسم: {c['label']}")
+
+    if rows:
+        df = pd.DataFrame(rows)
+        if alt is not None:
+            yscale = alt.Scale(type="log") if sim["log_y"] else alt.Scale(zero=False)
+            line = alt.Chart(df).mark_line().encode(
+                x=alt.X("x:Q", title=sim["x_label"]),
+                y=alt.Y("y:Q", title=sim["y_label"], scale=yscale),
+                color=alt.Color("curve:N", title=None,
+                                legend=alt.Legend(orient="bottom")))
+            layers = line
+            if pts:
+                layers = line + alt.Chart(pd.DataFrame(pts)).mark_point(
+                    size=130, filled=True).encode(x="x:Q", y="y:Q", color="curve:N")
+            show_chart(layers.properties(height=320))
+        else:
+            st.line_chart(df.pivot_table(index="x", columns="curve", values="y"))
+    else:
+        st.warning("المعادلة ما طلّعتش قيم صالحة بالقيم دي. جرّب تغيّر السلايدرات.")
+
+    if sim["readouts"]:
+        cols = st.columns(len(sim["readouts"]))
+        for col, r in zip(cols, sim["readouts"]):
+            try:
+                val = float(np.asarray(safe_eval(r["expr"], base)).reshape(-1)[0])
+                col.metric(r["label"], f"{val:.4g}")
+            except Exception:
+                col.metric(r["label"], "—")
+
+    if sim["observe"]:
+        items = "".join(f"<li>{esc(o)}</li>" for o in sim["observe"])
+        st.markdown(f'<div style="direction:{d};text-align:{a};line-height:1.8">'
+                    f'<b>{"🔎 لاحظ إن:" if rtl else "🔎 Notice:"}</b><ul>{items}</ul></div>',
+                    unsafe_allow_html=True)
+
+
+def sim_tab(provider, model_name):
+    st.write("حوّل أي معادلة في المحاضرة لتجربة تلعب فيها بالسلايدرات وتشوف الرسم بيتغير قدامك. "
+             "ارفع محاضرة (PDF أو صور) أو اكتب اسم المعادلة بنفسك.")
+    topic = st.text_input("المعادلة أو الموضوع (اختياري لو رفعت ملف)",
+                          placeholder="مثال: معادلة أرينيوس، أو Henderson-Hasselbalch، أو VO2max",
+                          key="sim_topic")
+    files = st.file_uploader("المحاضرة (PDF أو صور)", type=SRC_TYPES,
+                             accept_multiple_files=True, key="sim_files")
+    c1, c2 = st.columns(2)
+    n = c1.slider("عدد المحاكيات", 1, 3, 1, key="sim_n")
+    lang_opt = c2.selectbox("لغة الشرح", ["نفس لغة المصدر", "العربية", "English"], key="sim_lang")
+
+    if (files or topic.strip()) and st.button("ابنِ المحاكي 🎛️"):
+        src = ""
+        if files:
+            try:
+                src = read_sources(files, provider, model_name, api_key)
+            except Exception as e:
+                st.error(str(e)[:250])
+                return
+        if len(src) > MAX_CHARS:
+            src = src[:MAX_CHARS]
+            st.info("الملف طويل، فالمحاكي مبني على أول جزء منه.")
+        if topic.strip():
+            src += f"\n\nSTUDENT REQUEST: {topic.strip()}"
+        if not src.strip():
+            st.error("معرفتش أقرأ أي محتوى.")
+            return
+
+        if lang_opt == "العربية":
+            lang_name, rtl = "Arabic", True
+        elif lang_opt == "English":
+            lang_name, rtl = "English", False
+        else:
+            lang_name, rtl = detect_lang(src)
+        focus = (f"Focus on this request from the student: {topic.strip()}" if topic.strip()
+                 else "Pick the most important relationships that can be simulated.")
+        prompt = (SIM_PROMPT.replace("@N@", str(n)).replace("@FOCUS@", focus)
+                  .replace("@LANG@", lang_name))
+
+        with st.spinner("بجهّز المحاكي..."):
+            try:
+                raw = call_model(provider, model_name, [("text", src)], system=prompt)
+                data = parse_json_block(raw)
+                sims = [s for s in (clean_sim(x) for x in data.get("simulations", [])) if s]
+            except Exception as e:
+                st.error(f"معرفتش أجهّز المحاكي: {str(e)[:250]}. جرّب تاني أو غيّر النموذج.")
+                return
+        if not sims:
+            st.error("معرفتش أطلّع محاكي من المحتوى ده. جرّب تكتب اسم المعادلة بنفسك.")
+            return
+        st.session_state.sims = (sims, rtl, st.session_state.get("sim_gen", 0) + 1)
+        st.session_state.sim_gen = st.session_state.sims[2]
+
+    saved = st.session_state.get("sims")
+    if saved:
+        sims, rtl, gen = saved
+        st.divider()
+        st.warning("قارن المعادلة المكتوبة تحت العنوان بالمحاضرة، لأن النموذج ممكن يغلط في صياغتها أو في الأرقام.")
+        for i, sim in enumerate(sims):
+            with st.expander(f"🎛️ {sim['title']}", expanded=(i == 0)):
+                render_sim(sim, i, gen, rtl)
+        if st.button("🗑️ امسح المحاكيات"):
+            st.session_state.pop("sims", None)
+            st.rerun()
+
+
 # ---------------------------------------------------------------- التشغيل
 if api_key:
     if provider == "Gemini":
@@ -525,8 +1013,13 @@ if api_key:
 
     model_name = st.selectbox("اختر النموذج:", models, index=0)
 
-    tab1, tab2 = st.tabs(["🌐 الترجمة", "🧠 كويز تفاعلي"])
+    tab1, tab2, tab3, tab4 = st.tabs(
+        ["🌐 الترجمة", "🧠 كويز تفاعلي", "📸 حل ورقة من صورة", "🎛️ محاكي المعادلات"])
     with tab1:
         translate_tab(provider, model_name)
     with tab2:
         quiz_tab(provider, model_name)
+    with tab3:
+        solve_tab(provider, model_name)
+    with tab4:
+        sim_tab(provider, model_name)
